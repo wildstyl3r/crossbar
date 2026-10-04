@@ -40,12 +40,16 @@ impl LogitsProcessor {
         let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
 
         let mut indices: Vec<usize> = (0..probs.len()).collect();
-        indices.sort_unstable_by(|&i, &j| probs[j].total_cmp(&probs[i]));
-
-        if let Some(k) = self.top_k
-            && k > 0 && k < indices.len() {
+        match self.top_k.filter(|&k| k > 0 && k < probs.len()) {
+            Some(k) => {
+                indices.select_nth_unstable_by(k - 1, |&i, &j| probs[j].total_cmp(&probs[i]));
                 indices.truncate(k);
+                indices.sort_unstable_by(|&i, &j| probs[j].total_cmp(&probs[i]));
             }
+            None => {
+                indices.sort_unstable_by(|&i, &j| probs[j].total_cmp(&probs[i]));
+            }
+        }
         if let Some(p) = self.top_p {
             let p = p.clamp(0.0, 1.0) as f32;
             let mut cumsum = 0f32;
