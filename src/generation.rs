@@ -1,8 +1,10 @@
 use anyhow::{Context, Error as E, Result};
 use candle::{DType, Device, Tensor};
+use std::collections::HashSet;
 use std::io::Write;
 use tokenizers::Tokenizer;
 
+use crate::model::FeedbackStats;
 use crate::Engine;
 use crate::sampling::{apply_repeat_penalty, LogitsProcessor};
 
@@ -86,6 +88,7 @@ pub struct TextGeneration {
     eos_tokens: Vec<u32>,
     debug_logits: bool,
     softmax_feedback: bool,
+    diagnostics: bool,
 }
 
 impl TextGeneration {
@@ -103,6 +106,7 @@ impl TextGeneration {
         device: &Device,
         debug_logits: bool,
         softmax_feedback: bool,
+        diagnostics: bool,
     ) -> Self {
         let logits_processor = LogitsProcessor::new(seed, temperature, top_k, top_p);
         Self {
@@ -115,6 +119,7 @@ impl TextGeneration {
             device: device.clone(),
             debug_logits,
             softmax_feedback,
+            diagnostics,
         }
     }
 
@@ -143,12 +148,15 @@ impl TextGeneration {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
             let t = std::time::Instant::now();
-            let logits = match prev_logits.take() {
-                Some(prev) => self.model.forward_feedback(&prev, start_pos)?,
+            let (logits, fb_stats): (Tensor, Option<FeedbackStats>) = match prev_logits.take() {
+                Some(prev) => {
+                    let (l, s) = self.model.forward_feedback(&prev, start_pos)?;
+                    (l, Some(s))
+                }
                 None => {
                     let ctxt = &tokens[start_pos..];
                     let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    self.model.forward(&input, start_pos)?
+                    (self.model.forward(&input, start_pos)?, None)
                 }
             };
             let forward = t.elapsed();
@@ -175,6 +183,21 @@ impl TextGeneration {
                 }
             }
 
+            let diag_raw = if self.diagnostics {
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                let log_z = max as f64 + (sum as f64).ln();
+                let pl: f64 = exps
+                    .iter()
+                    .zip(logits.iter())
+                    .map(|(e, l)| (e / sum) as f64 * (*l as f64))
+                    .sum();
+                Some((exps, sum, log_z - pl))
+            } else {
+                None
+            };
+
             if self.repeat_penalty != 1. {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
                 apply_repeat_penalty(&mut logits, self.repeat_penalty, &tokens[start_at..]);
@@ -192,6 +215,34 @@ impl TextGeneration {
             }
             tokens.push(next_token);
             generated_tokens += 1;
+            if self.diagnostics {
+                if index == 0 {
+                    eprintln!("# step,T,H_fb,support,norm_x,cos_prev,raw_H,surprisal,distinct2");
+                }
+                let (exps, sum, raw_h) = diag_raw.as_ref().unwrap();
+                let surprisal = (*sum as f64 / exps[next_token as usize] as f64).ln();
+                let generated = &tokens[prompt_len..];
+                let win = &generated[generated.len().saturating_sub(33)..];
+                let mut bigrams: HashSet<(u32, u32)> = HashSet::new();
+                let mut count = 0usize;
+                for w in win.windows(2) {
+                    bigrams.insert((w[0], w[1]));
+                    count += 1;
+                }
+                let distinct2 = if count > 0 {
+                    bigrams.len() as f64 / count as f64
+                } else {
+                    1.0
+                };
+                let (t_used, h_fb, support, norm_x, cos_prev) = match fb_stats {
+                    Some(s) => (s.temperature, s.entropy, s.support, s.input_norm, s.cosine_prev),
+                    None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+                };
+                eprintln!(
+                    "{},{:.4},{:.4},{:.2},{:.3},{:.4},{:.4},{:.4},{:.3}",
+                    index, t_used, h_fb, support, norm_x, cos_prev, raw_h, surprisal, distinct2
+                );
+            }
             if self.eos_tokens.contains(&next_token) {
                 break;
             }

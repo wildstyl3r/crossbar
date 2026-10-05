@@ -78,9 +78,38 @@ struct Args {
 
     /// Softmax temperature for --softmax-feedback; 0 approaches the argmax
     /// token's embedding (i.e. normal generation), large values approach the
-    /// mean embedding.
+    /// mean embedding. Used as the base value by the heuristic mode.
     #[arg(long, default_value_t = 1.0)]
     softmax_feedback_temperature: f64,
+
+    /// How the feedback temperature is chosen each step: the fixed value,
+    /// an entropy-matched servo, or a threshold-based heuristic.
+    #[arg(long, value_enum, default_value = "fixed")]
+    softmax_feedback_mode: model::FeedbackTempMode,
+
+    /// Target entropy (nats) of the feedback distribution for
+    /// --softmax-feedback-mode entropy-servo (exact) and heuristic (band
+    /// center).
+    #[arg(long, default_value_t = 2.5)]
+    softmax_feedback_target_entropy: f64,
+
+    /// Half-width of the entropy band for --softmax-feedback-mode heuristic.
+    #[arg(long, default_value_t = 1.0)]
+    softmax_feedback_band: f64,
+
+    /// Multiplicative decay/growth factor for --softmax-feedback-mode
+    /// heuristic.
+    #[arg(long, default_value_t = 0.8)]
+    softmax_feedback_decay: f64,
+
+    /// Consecutive-feedback cosine above which --softmax-feedback-mode
+    /// heuristic decays the temperature.
+    #[arg(long, default_value_t = 0.999)]
+    softmax_feedback_max_cosine: f64,
+
+    /// Print per-step feedback diagnostics as CSV lines to stderr.
+    #[arg(long)]
+    softmax_feedback_diagnostics: bool,
 }
 
 enum Engine {
@@ -104,7 +133,7 @@ impl Engine {
         &mut self,
         logits: &candle::Tensor,
         pos: usize,
-    ) -> candle::Result<candle::Tensor> {
+    ) -> candle::Result<(candle::Tensor, model::FeedbackStats)> {
         match self {
             Self::F32(m) => m.forward_feedback(logits, pos),
             Self::Quantized(m) => m.forward_feedback(logits, pos),
@@ -223,7 +252,12 @@ fn main() -> Result<()> {
         Device::cuda_if_available(0)?
     };
     let feedback = model::FeedbackConfig {
+        mode: args.softmax_feedback_mode,
         temperature: args.softmax_feedback_temperature,
+        target_entropy: args.softmax_feedback_target_entropy,
+        band: args.softmax_feedback_band,
+        decay: args.softmax_feedback_decay,
+        max_cosine: args.softmax_feedback_max_cosine,
     };
     let mut engine = if let Some(ref gguf_path) = gguf_file {
         println!("backend: gguf (quantized) - {}", gguf_path.display());
@@ -287,9 +321,22 @@ fn main() -> Result<()> {
     );
     if args.softmax_feedback {
         println!(
-            "softmax feedback: on, temperature: {:.3}",
-            args.softmax_feedback_temperature
+            "softmax feedback: on, mode: {:?}, temperature: {:.3}, target entropy: {:.2}",
+            args.softmax_feedback_mode,
+            args.softmax_feedback_temperature,
+            args.softmax_feedback_target_entropy
         );
+        if args.softmax_feedback_mode == model::FeedbackTempMode::Heuristic {
+            println!(
+                "  heuristic band: {:.2}, decay: {:.2}, max cosine: {:.3}",
+                args.softmax_feedback_band,
+                args.softmax_feedback_decay,
+                args.softmax_feedback_max_cosine
+            );
+        }
+        if args.softmax_feedback_diagnostics {
+            println!("  diagnostics: per-step CSV on stderr");
+        }
     }
 
     let mut eos_tokens = generation_config.eos_ids();
@@ -313,6 +360,7 @@ fn main() -> Result<()> {
         &device,
         args.debug_logits,
         args.softmax_feedback,
+        args.softmax_feedback_diagnostics,
     );
     pipeline.run(&prompt, args.sample_len)?;
     Ok(())

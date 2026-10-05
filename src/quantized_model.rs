@@ -2,12 +2,12 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use candle::quantized::{gguf_file, QMatMul as InnerQMatMul, QTensor};
-use candle::{DType, Device, Module, Result, Tensor};
+use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{kv_cache::KvCache, kv_cache::RotatingKvCache, Activation, Embedding};
 
 use crate::model::{
-    prepare_decoder_attention_mask, repeat_kv, Config, FeedbackConfig, KvCacheKind, ProbeOut,
-    RmsNorm, RotaryEmbedding,
+    prepare_decoder_attention_mask, repeat_kv, solve_entropy_temperature, Config, FeedbackConfig,
+    FeedbackStats, FeedbackTempMode, KvCacheKind, ProbeOut, RmsNorm, RotaryEmbedding,
 };
 
 struct QMatMul {
@@ -218,6 +218,10 @@ pub struct QuantizedModel {
     hidden_size: usize,
     sliding_window: usize,
     feedback: FeedbackConfig,
+    /// Current temperature for the Heuristic mode; reset by clear_kv_cache.
+    heuristic_t: f64,
+    /// Previous fed-back input and its norm, for the consecutive cosine.
+    last_input: Option<(Tensor, f64)>,
     /// F32 copy of the embedding table, built lazily for the softmax
     /// feedback (the stored table is BF16).
     embeddings_f32: Option<Tensor>,
@@ -359,6 +363,8 @@ impl QuantizedModel {
             hidden_size: cfg.hidden_size,
             sliding_window: cfg.sliding_window,
             feedback,
+            heuristic_t: feedback.temperature,
+            last_input: None,
             embeddings_f32: None,
         })
     }
@@ -435,26 +441,42 @@ impl QuantizedModel {
 
     /// Feed the previous step's expected token embedding back into the first
     /// block, skipping the embedding lookup of the sampled token.
+    /// Feed the previous step's expected token embedding back into the first
+    /// block, skipping the embedding lookup of the sampled token. Also
+    /// resolves the feedback temperature for the configured mode and returns
+    /// the per-step feedback statistics.
     pub fn forward_feedback(
         &mut self,
         logits: &Tensor,
         seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        let xs = self.expected_embedding(logits)?;
+    ) -> Result<(Tensor, FeedbackStats)> {
+        let (xs, stats) = self.feedback_input(logits)?;
         let (b_size, seq_len, _) = xs.dims3()?;
 
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
-        self.finish(xs)
+        Ok((self.finish(xs)?, stats))
     }
 
-    fn expected_embedding(&mut self, logits: &Tensor) -> Result<Tensor> {
-        let temperature = self.feedback.temperature.max(1e-6);
-        let logits = (logits.to_dtype(DType::F32)? / temperature)?;
-        let (b_sz, seq_len, vocab) = logits.dims3()?;
-        let probs = candle_nn::ops::softmax_last_dim(&logits)?.reshape((b_sz * seq_len, vocab))?;
+    fn feedback_input(&mut self, logits: &Tensor) -> Result<(Tensor, FeedbackStats)> {
+        let logits_f32 = logits.to_dtype(DType::F32)?;
+        let temperature = match self.feedback.mode {
+            FeedbackTempMode::Fixed => self.feedback.temperature,
+            FeedbackTempMode::EntropyServo => {
+                solve_entropy_temperature(&logits_f32, self.feedback.target_entropy)?
+            }
+            FeedbackTempMode::OneSidedServo => {
+                solve_entropy_temperature(&logits_f32, self.feedback.target_entropy)?.min(1.0)
+            }
+            FeedbackTempMode::Heuristic => self.heuristic_t,
+        };
+        let probs = candle_nn::ops::softmax_last_dim(&(logits_f32 / temperature)?)?;
+        let logp = (&probs + 1e-12)?.log()?;
+        let entropy = -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64);
+        let (b_sz, seq_len, vocab) = probs.dims3()?;
+        let probs = probs.reshape((b_sz * seq_len, vocab))?;
         if self.embeddings_f32.is_none() {
             self.embeddings_f32 = Some(self.embed_tokens.embeddings().to_dtype(DType::F32)?);
         }
@@ -462,14 +484,55 @@ impl QuantizedModel {
         let xs = probs.matmul(embeddings)?;
         let xs = xs
             .reshape((b_sz, seq_len, ()))?
-            .affine((self.hidden_size as f64).sqrt(), 0.0)?;
-        xs.to_dtype(self.dtype)
+            .affine((self.hidden_size as f64).sqrt(), 0.0)?
+            .to_dtype(self.dtype)?;
+        let xs_f32 = xs.to_dtype(DType::F32)?;
+        let norm = xs_f32
+            .sqr()?
+            .sum_keepdim(D::Minus1)?
+            .sqrt()?
+            .sum_all()?
+            .to_scalar::<f32>()? as f64;
+        let cosine_prev = match &self.last_input {
+            Some((prev, prev_norm)) => {
+                let dot = (&xs_f32 * prev)?.sum_all()?.to_scalar::<f32>()? as f64;
+                if *prev_norm > 0.0 && norm > 0.0 {
+                    dot / (prev_norm * norm)
+                } else {
+                    f64::NAN
+                }
+            }
+            None => f64::NAN,
+        };
+        self.last_input = Some((xs_f32, norm));
+        if matches!(self.feedback.mode, FeedbackTempMode::Heuristic) {
+            let smear = entropy > self.feedback.target_entropy + self.feedback.band
+                || cosine_prev > self.feedback.max_cosine;
+            let overconfident = entropy < self.feedback.target_entropy - self.feedback.band;
+            let mut next = self.heuristic_t;
+            if smear {
+                next = (next * self.feedback.decay).max(1e-3);
+            } else if overconfident {
+                next = (next / self.feedback.decay).min(20.0);
+            }
+            self.heuristic_t = next;
+        }
+        let stats = FeedbackStats {
+            temperature,
+            entropy,
+            support: entropy.exp(),
+            input_norm: norm,
+            cosine_prev,
+        };
+        Ok((xs, stats))
     }
 
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+        self.heuristic_t = self.feedback.temperature;
+        self.last_input = None;
     }
 
     pub fn probe(&mut self, token: u32) -> Result<ProbeOut> {

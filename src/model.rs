@@ -412,12 +412,85 @@ pub(crate) fn prepare_decoder_attention_mask(
         .to_dtype(dtype)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum FeedbackTempMode {
+    /// Constant temperature from --softmax-feedback-temperature.
+    Fixed,
+    /// Per-step servo: solve T so that H(softmax(logits / T)) equals the
+    /// target entropy.
+    EntropyServo,
+    /// Like EntropyServo, but the solution is capped at T <= 1: the servo
+    /// only tames entropy explosions (T < 1) and otherwise falls back to the
+    /// model's own distribution (T = 1) instead of blurring confident steps.
+    OneSidedServo,
+    /// Persistent temperature, multiplicatively decayed/grown when the
+    /// measured feedback statistics leave the target entropy band or the
+    /// consecutive inputs stagnate.
+    Heuristic,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FeedbackConfig {
+    pub mode: FeedbackTempMode,
     /// Softmax temperature of the fed-back expected token embedding
     /// softmax(logits / T) @ E_scaled; T -> 0 approaches the argmax token's
     /// embedding (i.e. normal generation), T -> inf the mean embedding.
+    /// Used directly by Fixed and as the base value by Heuristic.
     pub temperature: f64,
+    /// Target entropy (nats) of the feedback distribution: exact target for
+    /// EntropyServo and OneSidedServo, band center for Heuristic.
+    pub target_entropy: f64,
+    /// Half-width of the entropy band for Heuristic.
+    pub band: f64,
+    /// Multiplicative decay/growth factor for Heuristic.
+    pub decay: f64,
+    /// Consecutive-input cosine above which Heuristic decays the temperature.
+    pub max_cosine: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FeedbackStats {
+    pub temperature: f64,
+    /// Entropy of the feedback distribution in nats.
+    pub entropy: f64,
+    /// Effective support exp(entropy).
+    pub support: f64,
+    /// L2 norm of the fed-back expected embedding.
+    pub input_norm: f64,
+    /// Cosine between consecutive fed-back inputs; NaN on the first step.
+    pub cosine_prev: f64,
+}
+
+/// Entropy of softmax(logits / T) in nats.
+fn entropy_at_temperature(logits: &Tensor, temperature: f64) -> Result<f64> {
+    let probs = candle_nn::ops::softmax_last_dim(&(logits / temperature)?)?;
+    let logp = (&probs + 1e-12)?.log()?;
+    let h = (&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64;
+    Ok(-h)
+}
+
+/// Solve T such that H(softmax(logits / T)) = target. H is non-decreasing
+/// in T (dH/dT = Var(logits) / T^3), so a bisection over [1e-3, 20] applies;
+/// targets outside the achievable range clamp to the bracket ends.
+pub(crate) fn solve_entropy_temperature(logits: &Tensor, target: f64) -> Result<f64> {
+    let (t_min, t_max) = (1e-3f64, 20.0f64);
+    if entropy_at_temperature(logits, t_min)? >= target {
+        return Ok(t_min);
+    }
+    if entropy_at_temperature(logits, t_max)? <= target {
+        return Ok(t_max);
+    }
+    let mut lo = t_min;
+    let mut hi = t_max;
+    for _ in 0..10 {
+        let mid = 0.5 * (lo + hi);
+        if entropy_at_temperature(logits, mid)? < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(0.5 * (lo + hi))
 }
 
 pub struct Model {
@@ -431,6 +504,10 @@ pub struct Model {
     hidden_size: usize,
     sliding_window: usize,
     feedback: FeedbackConfig,
+    /// Current temperature for the Heuristic mode; reset by clear_kv_cache.
+    heuristic_t: f64,
+    /// Previous fed-back input and its norm, for the consecutive cosine.
+    last_input: Option<(Tensor, f64)>,
 }
 
 impl Model {
@@ -480,6 +557,8 @@ impl Model {
             hidden_size: cfg.hidden_size,
             sliding_window: cfg.sliding_window,
             feedback,
+            heuristic_t: feedback.temperature,
+            last_input: None,
         })
     }
 
@@ -554,39 +633,94 @@ impl Model {
     }
 
     /// Feed the previous step's expected token embedding back into the first
-    /// block, skipping the embedding lookup of the sampled token.
+    /// block, skipping the embedding lookup of the sampled token. Also
+    /// resolves the feedback temperature for the configured mode and returns
+    /// the per-step feedback statistics.
     pub fn forward_feedback(
         &mut self,
         logits: &Tensor,
         seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        let xs = self.expected_embedding(logits)?;
+    ) -> Result<(Tensor, FeedbackStats)> {
+        let (xs, stats) = self.feedback_input(logits)?;
         let (b_size, seq_len, _) = xs.dims3()?;
 
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
-        self.finish(xs)
+        Ok((self.finish(xs)?, stats))
     }
 
-    fn expected_embedding(&self, logits: &Tensor) -> Result<Tensor> {
-        let temperature = self.feedback.temperature.max(1e-6);
-        let logits = (logits.to_dtype(DType::F32)? / temperature)?;
-        let (b_sz, seq_len, vocab) = logits.dims3()?;
-        let probs = candle_nn::ops::softmax_last_dim(&logits)?.reshape((b_sz * seq_len, vocab))?;
+    fn feedback_input(&mut self, logits: &Tensor) -> Result<(Tensor, FeedbackStats)> {
+        let logits_f32 = logits.to_dtype(DType::F32)?;
+        let temperature = match self.feedback.mode {
+            FeedbackTempMode::Fixed => self.feedback.temperature,
+            FeedbackTempMode::EntropyServo => {
+                solve_entropy_temperature(&logits_f32, self.feedback.target_entropy)?
+            }
+            FeedbackTempMode::OneSidedServo => {
+                solve_entropy_temperature(&logits_f32, self.feedback.target_entropy)?.min(1.0)
+            }
+            FeedbackTempMode::Heuristic => self.heuristic_t,
+        };
+        let probs = candle_nn::ops::softmax_last_dim(&(logits_f32 / temperature)?)?;
+        let logp = (&probs + 1e-12)?.log()?;
+        let entropy = -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64);
+        let (b_sz, seq_len, vocab) = probs.dims3()?;
+        let probs = probs.reshape((b_sz * seq_len, vocab))?;
         let embeddings = self.embed_tokens.embeddings();
         let xs = probs.to_dtype(embeddings.dtype())?.matmul(embeddings)?;
         let xs = xs
             .reshape((b_sz, seq_len, ()))?
-            .affine((self.hidden_size as f64).sqrt(), 0.0)?;
-        xs.to_dtype(self.dtype)
+            .affine((self.hidden_size as f64).sqrt(), 0.0)?
+            .to_dtype(self.dtype)?;
+        let xs_f32 = xs.to_dtype(DType::F32)?;
+        let norm = xs_f32
+            .sqr()?
+            .sum_keepdim(D::Minus1)?
+            .sqrt()?
+            .sum_all()?
+            .to_scalar::<f32>()? as f64;
+        let cosine_prev = match &self.last_input {
+            Some((prev, prev_norm)) => {
+                let dot = (&xs_f32 * prev)?.sum_all()?.to_scalar::<f32>()? as f64;
+                if *prev_norm > 0.0 && norm > 0.0 {
+                    dot / (prev_norm * norm)
+                } else {
+                    f64::NAN
+                }
+            }
+            None => f64::NAN,
+        };
+        self.last_input = Some((xs_f32, norm));
+        if matches!(self.feedback.mode, FeedbackTempMode::Heuristic) {
+            let smear = entropy > self.feedback.target_entropy + self.feedback.band
+                || cosine_prev > self.feedback.max_cosine;
+            let overconfident = entropy < self.feedback.target_entropy - self.feedback.band;
+            let mut next = self.heuristic_t;
+            if smear {
+                next = (next * self.feedback.decay).max(1e-3);
+            } else if overconfident {
+                next = (next / self.feedback.decay).min(20.0);
+            }
+            self.heuristic_t = next;
+        }
+        let stats = FeedbackStats {
+            temperature,
+            entropy,
+            support: entropy.exp(),
+            input_norm: norm,
+            cosine_prev,
+        };
+        Ok((xs, stats))
     }
 
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+        self.heuristic_t = self.feedback.temperature;
+        self.last_input = None;
     }
 
     pub fn probe(&mut self, token: u32) -> Result<ProbeOut> {        let row = self
