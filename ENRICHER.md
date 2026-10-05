@@ -168,12 +168,224 @@ Execution sequence (each step gates the next):
 - CPU throughput worse than estimated — 30-min checkpoints make partial
   runs useful; batch-1 grad-accum fallback.
 
-## Milestones beyond M1
+## Interim findings from the first training runs (runs 1-4)
 
-- **M2**: prefill/prompt enrichment via the *cascading* variant — position
-  n+1 processed with the enriched position n already in context (the
-  decode-feedback loop run over the prompt with forced tokens; the true
-  looped/universal-transformer K-iteration scheme). The parallel two-pass
-  prefill feedback exists since Finding 7 and is the ablation baseline.
-- **M3**: REINFORCE/GRPO finetune on exact-match reward; task family
-  expansion (multi-step state tracking, longer chains).
+Implementation progress so far: enricher module (`src/enrich.rs`, w_q/w_k/
+w_v/w_o/gate, zero-init W_o, VarMap + safetensors save/load), cache-free
+pad-aware training forward (`forward_inputs_train`, prompt-length bucketed
+batches so RoPE positions match inference exactly), CE warmup + guided
+ST-Gumbel phases, dual evaluation (teacher-forced argmax EM + free-running
+greedy EM), 30-min checkpoints.
+
+What the runs taught us, in order of importance:
+
+1. **The capitalization bug had two layers, and only one was obvious.**
+   The model naturally emits capitalized names ("Milu", "Zorp"); training
+   on lowercase targets ("milu") made the CE objective near-impossible
+   (~17-25 nats/token), and the gate learned the escape hatch: it switched
+   *itself off* (gate -> 0), which zeroes the W_o gradient and freezes the
+   module while the loss stays high. Fixes: (a) capitalized targets, and
+   (b) scoring was *also* case-sensitive (`w == answer` against lowercased
+   text) — every state-track example scored false regardless of the
+   model's output, silently corrupting all free-running EM numbers
+   reported earlier. Both fixed; scoring is now case-insensitive.
+
+2. **Gate dynamics need protection on both ends.** Run 1 (lowercase
+   targets): gate collapsed to 0 (escape hatch). Run 2 (capitalized):
+   converged beautifully (loss 17 -> 0.7-2.3, gate pinned at 1.0) but its
+   free-running eval collapsed into loop attractors ("KitMilMilMil…") —
+   the exposure mismatch between teacher-forced histories and free-running
+   generation, plus a free-running eval that had to restart from an
+   essentially untrained cold buffer. Run 3 (same seeds as run 2!) *still
+   collapsed* (gate -> 0, loss climbing) — see finding 3. Run 4 adds:
+   LR warmup over the first 50 steps (first-step CE ~17-25 produces huge
+   gradients), gate bias initialized at +2.0 (sigmoid ~ 0.88: the gate
+   starts OPEN and must learn to close, instead of starting closed at 0.5
+   and having to fight its way open), and a warmup-only gate floor of 0.5
+   (gate = floor + (1-floor)·sigma(...) so an early mis-step cannot shut
+    the module off and zero the W_o gradient). Run 4 trajectory: loss
+    8.7 (step 10) -> 1.5-3.5 oscillating, gate alive at 0.5-0.6 — no
+    collapse through warmup. **Run 4 terminal: the ST phase still collapsed
+    (gate -> 0 by ST step ~20, loss ~14-15 thereafter); the warmup gate
+    floor does not carry over into free-running, where unanchored
+    trajectories produce large, useless gradients.**
+
+3. **candle CPU matmuls are not run-to-run deterministic.** Two runs with
+   identical seeds, identical code, identical data: step-0 loss identical
+   (17.2452) but divergence by step 10 and completely different
+   trajectories (run 2 converged; run 3 gate-collapsed). Cause: thread
+   scheduling in parallel CPU reductions changes float summation order;
+   AdamW on a sharp loss surface amplifies tiny differences. Implication:
+   **fixed seeds do not guarantee reproducible training trajectories on
+   CPU**; checkpoints (kept) are the safety net, and run-to-run variance
+   must be treated as an experimental variable (report across 2-3 runs
+   when claiming effects).
+
+4. **Exposure bias is the dominant M1 gap** (from run 2: healthy
+   teacher-forced loss ~1.6, free-running loop attractors). The guided
+   ST-Gumbel phase exists precisely for this; its effectiveness is what
+   run 4's final dual evaluation will show.
+
+### Teacher-forcing check (run 4's terminal evaluation; what to look for)
+
+Run 4 ends with a dual evaluation on 200 held-out examples:
+
+- **teacher-forced EM, baseline (Pass-A logits) vs trained (Pass-B logits
+  with enriched answer slots)**: isolates the module's one-shot effect on
+  answer-slot predictions from generation dynamics. Baseline TF EM was
+  measured at 27.6% (note: with the fixed scoring this number needs
+  re-measurement; it was corrupted by the case bug for state-track).
+  Success criterion: trained TF EM >= baseline TF EM + 5 points.
+- **free-running EM, fresh-enricher (= baseline identity) vs trained
+  enricher**: the deployment-realistic number (states buffer + enrichment
+  active during generation). Baseline FR EM ~17% (same caveat).
+- Interpretation matrix:
+  - TF up, FR up: module learns useful enrichment; proceed to cascade +
+    bench transfer.
+  - TF up, FR flat/down: enrichment helps one-step predictions but the
+    buffer/state distribution differs under free running — the M1
+    approximation (Pass-A states at warmup vs enriched deploy states) and
+    exposure bias dominate; strengthen the ST phase or move to cascade
+    training (below).
+  - TF flat: the module found nothing beyond copying baseline logits;
+    check gate stats and window relevance before more compute.
+
+## Cascade decoding of the input (the user's original intent)
+
+The initial idea — position n+1 processed with the *enriched* position n
+already in its context, so each position's emergent distribution reflects
+already-enriched thinking — is the decode-feedback loop run over the prompt
+with forced tokens. Two realization schedules:
+
+### Schedule A: pure sequential cascade (per position)
+
+One forward per prompt position, each position's input enriched from the
+processed states of all previous positions. Inference: trivial with KV
+caches (~65 forwards/prompt ≈ 7 s — fine). Training: 65 sequential
+forwards per example per step — **not viable** for gradient training on
+CPU. Rejected for training; usable for inference-only probes.
+
+### Schedule B: chunked/iterated cascade (recommended)
+
+Observe that the existing `forward_prompt_blend` already implements
+**iteration 1** of the cascade: the observation pass (iteration 0) produces
+per-position logits; the injection pass (iteration 1) forwards the blended
+inputs and builds the cache. A true cascade is simply:
+
+```
+states/logits_0 = forward(E_prompt)                      # iteration 0
+for k in 1..=K:
+    inputs_k = (1-a) * E_prompt + a * expected(logits_{k-1})
+    logits_k = forward_all_positions(inputs_k)           # fresh caches
+# decode continues from iteration K's cache + last-position logits
+```
+
+- Cost: (K+1) full-sequence forwards (each ~1 prefill) + per-iteration
+  full-position logits (finish() over all positions; 64x262k F32 ≈ 67 MB
+  transient — fine). K=3 ⇒ ~4x prefill.
+- This is the **looped/universal-transformer schedule** with our blend
+  formula as the refinement operator: each iteration re-thinks every
+  prompt position with the *refined* context of the previous iteration in
+  its KV cache; the emergent distributions compound.
+- Known gap vs Schedule A: within one iteration, refinement is
+  chunk-parallel (all positions refined against the *same* previous
+  iteration), so the within-iteration sequentiality of Schedule A is
+  lost; K iterations approximate it (K=1 one-shot < K=2 < ... <=
+  sequential).
+- Implementation: moderate (~1-1.5 h). Restructure `forward_prompt_blend`
+  into the iteration loop above (`--prefill-feedback-iters K`, default 1
+  = current behavior; per-iteration full-position logits via `finish`
+  without the last-position narrow). Regression: K=1 must reproduce
+  current `prefill-p0.5` behavior exactly.
+- Training-time recipe (deferred): iterate the two-pass scheme K times
+  with **stop-grad on previous-iteration states/logits** (treat them as
+  constants; gradients flow through the current forward into the
+  enricher only). Cost K x 2 forwards per step (K=2 ≈ 12-20 s/step —
+  feasible). This directly trains the module under refined histories —
+  the proper fix for the M1 warmup approximation.
+
+### Minimalist cascade experiment (run 2026-10-06; inference-only, no training)
+
+Implemented as `--prefill-feedback-iters K` (Schedule B; iteration 0 = the
+original observation pass, bit-exact for K=1 — regression battery passed:
+CLI text and bench CSV identical to the pre-change binary for
+baseline/blend-d0.5/prefill-p0.5/both-0.5). Probes as designed, plus two
+extra bench columns that the P0 dynamics made necessary (cascade-k3,
+cascade-k2-a25).
+
+**P0 dynamics** (long France paragraph ending mid-sentence, greedy; step-1
+raw_H vs baseline 1.10, "The answer is **Paris."):
+
+| config | step-1 raw_H | continuation | verdict |
+|---|---|---|---|
+| K=1, a_p=0.25 | 0.21 | "The capital of France…" | healthy |
+| K=2, a_p=0.25 | 0.35 | "The capital of France…" | healthy |
+| K=3, a_p=0.25 | 0.71 | "The answer is **Paris." (≈ baseline) | healthy |
+| K=1, a_p=0.50 | 5.50 | "The country has a…" | destroyed (Finding 7) |
+| K=2, a_p=0.50 | 4.19 | "The country has a…" | destroyed (worse than K=1) |
+| K=3, a_p=0.50 | 3.21 | "The capital of France is Paris." | repaired (entropy elevated) |
+
+Repair is **non-monotone in K at fixed strength**: at a_p=0.5 the
+compounding lookahead first deepens the destruction, then iteration turns it
+around (K=3). Per-iteration prefill entropies (diagnostics): a_p=0.5 →
+1.36 → 2.91 → 2.67 (does not sharpen); a_p=0.25 → 1.36 → 1.56 → 1.55.
+
+**Bench triage** (greedy, paired; triage N=25, then the winning config
+confirmed):
+
+| task | baseline | blend-d0.5 | prefill-p0.5 | cascade-k2 (a.5) | cascade-k3 (a.5) | cascade-k2-a25 |
+|---|---|---|---|---|---|---|
+| digits-5 | 100% | 100% | 0% | 8% | 4% | 88% |
+| digits-10 | 96% | 96% | 0% | 52% | 0% | 84% |
+| induce | 64% | 60% | 4% | 12% | 4% | **80%** |
+
+(triage N=25, McNemar vs baseline in logs/cascade_bench25*.log)
+
+**Confirm run** (cascade-k2-a25 = K=2 iterations at a_p=0.25):
+
+| task | baseline | cascade-k2-a25 | p (McNemar) |
+|---|---|---|---|
+| induce (N=100) | 60% | **78%** | **0.006** |
+| trivia (N=40) | 72% | 72% | 1.000 |
+| digits-5 (N=50) | 100% | 94% | 0.250 |
+| digits-10 (N=50) | 96% | 88% | 0.219 |
+
+→ **Finding 8** (FEEDBACK.md): the refinement *schedule* itself carries
+value — at gentle strength the iterated cascade improves induction by +18
+points over baseline (and over blend-d0.5's 56%) with no collateral damage,
+before any training.
+
+**Decision (branch taken): cascade-helps ⇒ cascade-trained ST overnight run
+(K=2, stop-grad recipe) is prioritized over plain M1 ST** — after the run-4
+ST gate-collapse fix (below), since no trained enricher exists yet (the
+run-4 checkpoint is post-collapse ≈ identity). The a_p≥0.5 / K=3
+destruction is the strongest argument for the learned gate: strength must
+be context-dependent, not a fixed constant.
+
+Caveats: single-run (CPU run-to-run variance, Finding 3 — but greedy
+inference is deterministic in practice); induce mean generated length rose
+(6.5 vs 3.8 tokens — some answers run past the number before EOS), worth
+watching in the trained variant.
+
+## Strategy outline (updated)
+
+1. ~~Bench round 2 + Finding 7 + commit.~~ (done, edaf828)
+2. ~~Enricher module + integration + gradient sanity.~~ (done; runs 1-4)
+3. ~~Run 4~~ terminal state: warmup healthy (loss 1.5-3.5, gate 0.5-0.6),
+   but the ST phase collapsed again (gate -> 0 by ST step ~20, loss ~15;
+   log ends mid-run at st 120). The saved checkpoint is post-collapse
+   (gate ~= 0 => approximately the identity map) — **no usable trained
+   enricher exists yet**; the ST-phase gate-collapse fix is the immediate
+   blocker for any overnight run (candidate fixes: gate floor during ST,
+   lower ST lr, guided-ST annealing before free-running).
+4. ~~Implement `--prefill-feedback-iters` (Schedule B inference) + run the
+   minimalist cascade experiment.~~ (done 2026-10-06; **cascade-helps
+   branch**: Finding 8, induce +18 p=0.006 at K=2/a_p=0.25).
+5. Cascade-trained ST overnight run (K=2, stop-grad recipe) — **after** the
+   ST gate-collapse fix; the trained gate should own the strength schedule
+   (the a_p>=0.5 / K=3 destruction shows fixed strength cannot be saved by
+   depth alone).
+6. Bench `enricher` mode (+ `enricher+cascade`) vs baseline/blend-d0.5
+   (transfer check: digits/trivia unharmed) → further findings in
+   FEEDBACK.md → commit.
+7. M3: REINFORCE/GRPO finetune; task family expansion.

@@ -222,6 +222,9 @@ pub struct QuantizedModel {
     heuristic_t: f64,
     /// Previous fed-back input and its norm, for the consecutive cosine.
     last_input: Option<(Tensor, f64)>,
+    /// Optional trained attention-pooling enricher; when present it replaces
+    /// the softmax-blend formula for the decode input.
+    pub enricher: Option<crate::enrich::Enricher>,
     /// F32 copy of the embedding table, built lazily for the softmax
     /// feedback (the stored table is BF16).
     embeddings_f32: Option<Tensor>,
@@ -365,6 +368,7 @@ impl QuantizedModel {
             feedback,
             heuristic_t: feedback.temperature,
             last_input: None,
+            enricher: None,
             embeddings_f32: None,
         })
     }
@@ -436,7 +440,15 @@ impl QuantizedModel {
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
-        self.finish(xs.narrow(1, seq_len - 1, 1)?)
+        let last = xs.narrow(1, seq_len - 1, 1)?;
+        let out = self.finish(last.clone())?;
+        if self.enricher.is_some() {
+            let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
+            if let Some(enr) = &mut self.enricher {
+                enr.push_state(state);
+            }
+        }
+        Ok(out)
     }
 
     /// Feed the previous step's blended input (expected token embedding +
@@ -450,6 +462,34 @@ impl QuantizedModel {
         sampled_token: u32,
         seqlen_offset: usize,
     ) -> Result<(Tensor, FeedbackStats)> {
+        if self.enricher.is_some() {
+            let window = self.enricher.as_ref().unwrap().window().to_vec();
+            let token = Tensor::new(&[sampled_token], &self.device)?.unsqueeze(0)?;
+            let e = self
+                .embed_tokens
+                .forward(&token)?
+                .to_dtype(DType::F32)?
+                .squeeze(0)?
+                .squeeze(0)?;
+            let input = self.enricher.as_ref().unwrap().enrich(&e, &window)?;
+            let input = input.unsqueeze(0)?.unsqueeze(0)?;
+            let (attention_mask, sliding_attention_mask) =
+                self.create_attention_masks(1, 1, seqlen_offset)?;
+            let xs = self.run_layers(input, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
+            let last = xs.narrow(1, 0, 1)?;
+            let out = self.finish(last.clone())?;
+            if let Some(enr) = &mut self.enricher {
+                enr.push_state(last.squeeze(1)?.squeeze(0)?.contiguous()?);
+            }
+            let stats = FeedbackStats {
+                temperature: f64::NAN,
+                entropy: f64::NAN,
+                support: f64::NAN,
+                input_norm: f64::NAN,
+                cosine_prev: f64::NAN,
+            };
+            return Ok((out, stats));
+        }
         let (xs, stats) = self.feedback_input(logits, sampled_token)?;
         let (b_size, seq_len, _) = xs.dims3()?;
 
@@ -575,6 +615,11 @@ impl QuantizedModel {
         let (b_size, seq_len) = input_ids.dims2()?;
         const CHUNK: usize = 64;
         let alpha = self.feedback.prefill_blend.clamp(0.0, 1.0);
+        if self.feedback.prefill_iters > 1 {
+            candle::bail!(
+                "iterated prefill feedback (cascade) requires the safetensors backend"
+            );
+        }
         let mut expected_chunks: Vec<Tensor> = Vec::new();
         let mut t_sum = 0f64;
         let mut h_sum = 0f64;
@@ -628,8 +673,17 @@ impl QuantizedModel {
         let stats = PrefillStats {
             temperature: if n_positions > 0 { t_sum / (seq_len as f64 / CHUNK as f64).ceil() } else { f64::NAN },
             entropy: if n_positions > 0 { h_sum / n_positions as f64 } else { f64::NAN },
+            iters: 1,
+            entropies: vec![if n_positions > 0 { h_sum / n_positions as f64 } else { f64::NAN }],
         };
-        let logits = self.finish(xs.narrow(1, seq_len - 1, 1)?)?;
+        let last = xs.narrow(1, seq_len - 1, 1)?;
+        let logits = self.finish(last.clone())?;
+        if self.enricher.is_some() {
+            let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
+            if let Some(enr) = &mut self.enricher {
+                enr.push_state(state);
+            }
+        }
         Ok((logits, stats))
     }
 
@@ -639,10 +693,23 @@ impl QuantizedModel {
         }
     }
 
+    /// Attach a trained enricher (inference); replaces the softmax-blend
+    /// decode feedback with the learned attention-pooling enrichment.
+    pub fn set_enricher(&mut self, enr: crate::enrich::Enricher) {
+        self.enricher = Some(enr);
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.reset_layer_caches();
         self.heuristic_t = self.feedback.temperature;
         self.last_input = None;
+        if let Some(enr) = &mut self.enricher {
+            enr.clear_states();
+        }
     }
 
     pub fn probe(&mut self, token: u32) -> Result<ProbeOut> {

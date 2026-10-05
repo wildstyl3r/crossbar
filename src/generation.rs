@@ -204,10 +204,23 @@ impl TextGeneration {
                     if index == 0 && self.prefill_feedback {
                         let (l, ps) = self.model.forward_prompt_blend(&input)?;
                         if self.diagnostics {
-                            eprintln!(
-                                "# prefill-blend: T={:.4}, mean_H={:.4}",
-                                ps.temperature, ps.entropy
-                            );
+                            if ps.iters > 1 {
+                                let per_iter = ps
+                                    .entropies
+                                    .iter()
+                                    .map(|h| format!("{h:.4}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                eprintln!(
+                                    "# prefill-cascade: iters={}, T={:.4}, mean_H={:.4}, per_iter_H=[{per_iter}]",
+                                    ps.iters, ps.temperature, ps.entropy
+                                );
+                            } else {
+                                eprintln!(
+                                    "# prefill-blend: T={:.4}, mean_H={:.4}",
+                                    ps.temperature, ps.entropy
+                                );
+                            }
                         }
                         (l, None)
                     } else {
@@ -273,7 +286,9 @@ impl TextGeneration {
             }
             tokens.push(next_token);
             generated_tokens += 1;
-            if let Some(s) = &fb_stats {
+            if let Some(s) = &fb_stats
+                && !s.entropy.is_nan()
+            {
                 hfb_sum += s.entropy;
                 hfb_n += 1;
             }

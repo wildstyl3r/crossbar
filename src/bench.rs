@@ -26,6 +26,7 @@ fn fb_config(
     target_entropy: f64,
     blend: f64,
     prefill_blend: f64,
+    prefill_iters: usize,
 ) -> FeedbackConfig {
     FeedbackConfig {
         mode,
@@ -36,6 +37,7 @@ fn fb_config(
         max_cosine: 0.999,
         blend,
         prefill_blend,
+        prefill_iters,
     }
 }
 
@@ -307,29 +309,95 @@ pub fn run_bench(
     device: &Device,
     n: usize,
     out_path: &str,
+    enricher_path: Option<&str>,
+    tasks_filter: Option<&str>,
+    modes_filter: Option<&str>,
 ) -> Result<()> {
-    let examples = build_examples(n);
-    let modes = vec![
+    let examples = {
+        let mut examples = build_examples(n);
+        if let Some(filter) = tasks_filter {
+            let keep: std::collections::HashSet<&str> =
+                filter.split(',').map(|s| s.trim()).collect();
+            let unknown: Vec<&str> = keep
+                .iter()
+                .copied()
+                .filter(|t| !examples.iter().any(|e| e.task == *t))
+                .collect();
+            if !unknown.is_empty() {
+                anyhow::bail!("unknown bench task(s): {}", unknown.join(", "));
+            }
+            let total = examples.len();
+            examples.retain(|e| keep.contains(e.task));
+            println!(
+                "bench: task filter '{filter}': {} of {total} examples",
+                examples.len()
+            );
+        }
+        examples
+    };
+    let mut modes = vec![
         BenchMode { label: "baseline", feedback: None, decode: false, prefill: false },
-        BenchMode {
-            label: "blend-d0.5",
-            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 0.5, 0.0)),
+    ];
+    if enricher_path.is_some() {
+        modes.push(BenchMode {
+            label: "enricher",
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.0, 1)),
             decode: true,
             prefill: false,
-        },
-        BenchMode {
+        });
+    } else {
+        modes.push(BenchMode {
+            label: "blend-d0.5",
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 0.5, 0.0, 1)),
+            decode: true,
+            prefill: false,
+        });
+        modes.push(BenchMode {
             label: "prefill-p0.5",
-            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.5)),
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.5, 1)),
             decode: false,
             prefill: true,
-        },
-        BenchMode {
+        });
+        modes.push(BenchMode {
             label: "both-0.5",
-            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 0.5, 0.5)),
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 0.5, 0.5, 1)),
             decode: true,
             prefill: true,
-        },
-    ];
+        });
+        modes.push(BenchMode {
+            label: "cascade-k2",
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.5, 2)),
+            decode: false,
+            prefill: true,
+        });
+        modes.push(BenchMode {
+            label: "cascade-k3",
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.5, 3)),
+            decode: false,
+            prefill: true,
+        });
+        modes.push(BenchMode {
+            label: "cascade-k2-a25",
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.25, 2)),
+            decode: false,
+            prefill: true,
+        });
+    }
+    if let Some(filter) = modes_filter {
+        let keep: std::collections::HashSet<&str> = filter.split(',').map(|s| s.trim()).collect();
+        let unknown: Vec<&&str> = keep
+            .iter()
+            .filter(|m| !modes.iter().any(|mode| mode.label == **m))
+            .collect();
+        if !unknown.is_empty() {
+            let names: Vec<String> = unknown.iter().map(|s| s.to_string()).collect();
+            anyhow::bail!("unknown bench mode(s): {}", names.join(", "));
+        }
+        modes.retain(|mode| keep.contains(mode.label));
+    }
+    if !modes.iter().any(|m| m.label == "baseline") {
+        anyhow::bail!("the mode filter must keep 'baseline' (McNemar reference)");
+    }
     println!(
         "bench: {} examples x {} modes, greedy decoding, repeat-penalty 1.0",
         examples.len(),
@@ -350,8 +418,14 @@ pub fn run_bench(
         let start = std::time::Instant::now();
         let feedback = mode
             .feedback
-            .unwrap_or_else(|| fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.0));
-        let engine = (make_engine)(feedback)?;
+            .unwrap_or_else(|| fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.0, 1));
+        let mut engine = (make_engine)(feedback)?;
+        if mode.label == "enricher" {
+            if let Some(path) = enricher_path {
+                engine.set_enricher(path, 192, 8)?;
+                println!("  enricher: loaded from {path}");
+            }
+        }
         let mut pipeline = TextGeneration::new(
             engine,
             tokenizer.clone(),

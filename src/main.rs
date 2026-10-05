@@ -1,9 +1,11 @@
 mod bench;
 mod chat;
+mod enrich;
 mod generation;
 mod model;
 mod quantized_model;
 mod sampling;
+mod train;
 
 use anyhow::{Context, Error as E, Result};
 use clap::Parser;
@@ -36,6 +38,17 @@ struct Args {
     /// Output CSV path for --bench with per-example rows.
     #[arg(long, default_value = "bench_results.csv")]
     bench_out: String,
+
+    /// Comma-separated task filter for --bench (digits-5, digits-10,
+    /// digits-20, induce, trivia); default runs all tasks.
+    #[arg(long)]
+    bench_tasks: Option<String>,
+
+    /// Comma-separated mode filter for --bench (baseline, blend-d0.5,
+    /// prefill-p0.5, both-0.5, cascade-k2, cascade-k3, cascade-k2-a25);
+    /// 'baseline' is always required. Default runs all modes.
+    #[arg(long)]
+    bench_modes: Option<String>,
 
     /// Optional system prompt, folded into the first user turn.
     #[arg(long)]
@@ -108,6 +121,14 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     prefill_feedback_blend: f64,
 
+    /// Number of prefill-feedback refinement iterations (Schedule B
+    /// cascade): iteration 0 observes the raw prompt, iteration k re-forwards
+    /// (1 - a_p) * E + a_p * expected(logits_{k-1}) over all positions; 1 is
+    /// the single refinement pass (the original prefill feedback), >= 2 the
+    /// iterated cascade.
+    #[arg(long, default_value_t = 1)]
+    prefill_feedback_iters: usize,
+
     /// How the feedback temperature is chosen each step: the fixed value,
     /// an entropy-matched servo, or a threshold-based heuristic.
     #[arg(long, value_enum, default_value = "fixed")]
@@ -136,6 +157,27 @@ struct Args {
     /// Print per-step feedback diagnostics as CSV lines to stderr.
     #[arg(long)]
     softmax_feedback_diagnostics: bool,
+
+    /// Load a trained attention-pooling enricher checkpoint; replaces the
+    /// softmax-blend decode feedback with the learned enrichment.
+    #[arg(long)]
+    enricher: Option<String>,
+
+    /// Run the enricher training loop instead of generating from a prompt.
+    #[arg(long)]
+    train_enricher: bool,
+
+    /// Teacher-forced CE steps before the straight-through phase.
+    #[arg(long, default_value_t = 150)]
+    train_steps_warmup: usize,
+
+    /// Straight-through Gumbel free-running steps after warmup.
+    #[arg(long, default_value_t = 300)]
+    train_steps_st: usize,
+
+    /// Where the trained enricher checkpoint is written / reloaded from.
+    #[arg(long, default_value = "enricher.safetensors")]
+    train_out: String,
 }
 
 enum Engine {
@@ -189,6 +231,72 @@ impl Engine {
             Self::F32(m) => m.probe(token),
             Self::Quantized(m) => m.probe(token),
         }
+    }
+
+    fn set_enricher(&mut self, path: &str, r: usize, k: usize) -> Result<()> {
+        let hidden = match self {
+            Self::F32(m) => m.hidden_size(),
+            Self::Quantized(m) => m.hidden_size(),
+        };
+        let enr = enrich::Enricher::load(path, hidden, r, k)?;
+        match self {
+            Self::F32(m) => m.set_enricher(enr),
+            Self::Quantized(m) => m.set_enricher(enr),
+        }
+        Ok(())
+    }
+
+    fn forward_inputs_train(
+        &self,
+        xs: &candle::Tensor,
+        lens: &[usize],
+        answer_start: usize,
+        answer_len: usize,
+    ) -> candle::Result<(candle::Tensor, candle::Tensor)> {
+        match self {
+            Self::F32(m) => m.forward_inputs_train(xs, lens, answer_start, answer_len),
+            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
+        }
+    }
+
+    fn embed_scale(
+        &self,
+        input_ids: &candle::Tensor,
+        lens: &[usize],
+    ) -> candle::Result<candle::Tensor> {
+        match self {
+            Self::F32(m) => m.embed_scale(input_ids, lens),
+            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
+        }
+    }
+
+    fn embed_one(&self, token: &candle::Tensor) -> candle::Result<candle::Tensor> {
+        match self {
+            Self::F32(m) => m.embed_one(token),
+            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
+        }
+    }
+
+    fn expected_from_probs(&self, probs: &candle::Tensor) -> candle::Result<candle::Tensor> {
+        match self {
+            Self::F32(m) => m.expected_from_probs(probs),
+            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
+        }
+    }
+
+    fn hidden(&self) -> usize {
+        match self {
+            Self::F32(m) => m.hidden_size(),
+            Self::Quantized(m) => m.hidden_size(),
+        }
+    }
+
+    fn attach_enricher(&mut self, enr: enrich::Enricher) -> Result<()> {
+        match self {
+            Self::F32(m) => m.set_enricher(enr),
+            Self::Quantized(_) => anyhow::bail!("training requires the safetensors backend"),
+        }
+        Ok(())
     }
 }
 
@@ -322,12 +430,30 @@ fn main() -> Result<()> {
         max_cosine: args.softmax_feedback_max_cosine,
         blend: args.softmax_feedback_blend,
         prefill_blend: args.prefill_feedback_blend,
+        prefill_iters: args.prefill_feedback_iters,
     };
     let mut engine = make_engine(feedback)?;
+    if let Some(path) = &args.enricher {
+        engine.set_enricher(path, 192, 8)?;
+        println!("enricher: loaded from {path}");
+    }
     println!("loaded the model in {:?}", start.elapsed());
 
     let chat_template =
         std::fs::read_to_string(resolve_file(model_dir, fallback_dir, "chat_template.jinja")?)?;
+
+    if args.train_enricher {
+        train::run(
+            &mut engine,
+            &tokenizer,
+            &chat_template,
+            &device,
+            args.train_steps_warmup,
+            args.train_steps_st,
+            &args.train_out,
+        )?;
+        return Ok(());
+    }
 
     if args.probe {
         let token = tokenizer.token_to_id("Paris").context("no Paris token")?;
@@ -360,6 +486,9 @@ fn main() -> Result<()> {
             &device,
             args.bench_n,
             &args.bench_out,
+            args.enricher.as_deref(),
+            args.bench_tasks.as_deref(),
+            args.bench_modes.as_deref(),
         )?;
         return Ok(());
     }
@@ -411,6 +540,9 @@ fn main() -> Result<()> {
             "prefill feedback: on, blend: {:.2}",
             args.prefill_feedback_blend
         );
+        if args.prefill_feedback_iters != 1 {
+            println!("prefill cascade: iters: {}", args.prefill_feedback_iters);
+        }
     }
 
     let mut pipeline = generation::TextGeneration::new(

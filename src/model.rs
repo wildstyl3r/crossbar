@@ -291,6 +291,52 @@ impl Attention {
             KvCacheKind::Rotating(c) => c.reset(),
         }
     }
+
+    /// Cache-free attention for the training forward: full-sequence causal
+    /// attention with an explicit (pad-aware) additive mask, no KV cache.
+    fn forward_train(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
+        let value_states = self.v_proj.forward(xs)?;
+
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let query_states = self.q_norm.forward(&query_states)?;
+        let key_states = self.k_norm.forward(&key_states)?;
+
+        let (query_states, key_states) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_states, &key_states, 0)?;
+
+        let key_states = repeat_kv(key_states, self.num_kv_groups)?;
+        let value_states = repeat_kv(value_states, self.num_kv_groups)?;
+
+        let scale = 1f64 / f64::sqrt(self.query_pre_attn_scalar as f64);
+        let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+
+        let attn_weights = match self.attn_logit_softcapping {
+            None => attn_weights,
+            Some(sc) => ((attn_weights / sc)?.tanh()? * sc)?,
+        };
+
+        let attn_weights = attn_weights.broadcast_add(mask)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&value_states)?;
+
+        attn_output
+            .transpose(1, 2)?
+            .reshape((b_sz, q_len, ()))?
+            .apply(&self.o_proj)
+    }
 }
 
 pub(crate) fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
@@ -302,6 +348,32 @@ pub(crate) fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
             .expand((b_sz, num_kv_heads, n_rep, seq_len, head_dim))?
             .reshape((b_sz, num_kv_heads * n_rep, seq_len, head_dim))
     }
+}
+
+/// Causal attention mask for the cache-free training forward, with per-row
+/// padding: column j is masked unless j <= i, j < lens[b] and (for the
+/// sliding variant) j + window >= i.
+pub(crate) fn prepare_train_mask(
+    batch: usize,
+    seq_len: usize,
+    lens: &[usize],
+    sliding_window: Option<usize>,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut v = Vec::with_capacity(batch * seq_len * seq_len);
+    for b in 0..batch {
+        let len = lens.get(b).copied().unwrap_or(seq_len).min(seq_len);
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                let keep = j <= i
+                    && j < len
+                    && sliding_window.map_or(true, |w| j + w >= i);
+                v.push(if keep { 0f32 } else { f32::NEG_INFINITY });
+            }
+        }
+    }
+    Tensor::from_vec(v, (batch, 1, seq_len, seq_len), device)?.to_dtype(dtype)
 }
 
 struct DecoderLayer {
@@ -371,6 +443,20 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache()
+    }
+
+    /// Cache-free decoder layer for the training forward.
+    fn forward_train(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward_train(&xs, mask)?;
+        let xs = xs.apply(&self.post_attention_layernorm)?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = xs.apply(&self.pre_feedforward_layernorm)?;
+        let xs = xs.apply(&self.mlp)?;
+        let xs = xs.apply(&self.post_feedforward_layernorm)?;
+        residual + xs
     }
 }
 
@@ -452,6 +538,11 @@ pub struct FeedbackConfig {
     /// Weight of the per-position expected embedding in the prefill input;
     /// 0 disables prefill feedback.
     pub prefill_blend: f64,
+    /// Number of prefill-feedback refinement iterations (Schedule B
+    /// cascade): iteration 0 observes the raw prompt, iteration k re-forwards
+    /// `(1 - a_p) * E + a_p * expected(logits_{k-1})`; 1 is the single
+    /// refinement pass, >= 2 the iterated cascade.
+    pub prefill_iters: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -467,14 +558,18 @@ pub struct FeedbackStats {
     pub cosine_prev: f64,
 }
 
-/// Summary over all prefill positions of the prompt-feedback observation
-/// pass.
-#[derive(Debug, Clone, Copy)]
+/// Summary over all prefill positions of the prompt-feedback cascade.
+#[derive(Debug, Clone)]
 pub struct PrefillStats {
-    /// Mean of the per-chunk temperatures used.
+    /// Mean of the per-chunk temperatures of the observation pass.
     pub temperature: f64,
-    /// Mean per-position entropy of the feedback distributions, nats.
+    /// Mean per-position entropy of the iteration-0 feedback distributions,
+    /// nats.
     pub entropy: f64,
+    /// Number of refinement iterations (total full forwards = iters + 1).
+    pub iters: usize,
+    /// Mean per-position entropy per iteration, nats (index 0 = iteration 0).
+    pub entropies: Vec<f64>,
 }
 
 /// Entropy of softmax(logits / T) in nats.
@@ -524,6 +619,9 @@ pub struct Model {
     heuristic_t: f64,
     /// Previous fed-back input and its norm, for the consecutive cosine.
     last_input: Option<(Tensor, f64)>,
+    /// Optional trained attention-pooling enricher; when present it replaces
+    /// the softmax-blend formula for the decode input.
+    pub enricher: Option<crate::enrich::Enricher>,
 }
 
 impl Model {
@@ -575,6 +673,7 @@ impl Model {
             feedback,
             heuristic_t: feedback.temperature,
             last_input: None,
+            enricher: None,
         })
     }
 
@@ -645,7 +744,15 @@ impl Model {
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
-        self.finish(xs.narrow(1, seq_len - 1, 1)?)
+        let last = xs.narrow(1, seq_len - 1, 1)?;
+        let out = self.finish(last.clone())?;
+        if self.enricher.is_some() {
+            let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
+            if let Some(enr) = &mut self.enricher {
+                enr.push_state(state);
+            }
+        }
+        Ok(out)
     }
 
     /// Feed the previous step's expected token embedding back into the first
@@ -658,6 +765,33 @@ impl Model {
         sampled_token: u32,
         seqlen_offset: usize,
     ) -> Result<(Tensor, FeedbackStats)> {
+        if self.enricher.is_some() {
+            let window = self.enricher.as_ref().unwrap().window().to_vec();
+            let token = Tensor::new(&[sampled_token], &self.device)?.unsqueeze(0)?;
+            let e = self
+                .embed_tokens
+                .forward(&token)?
+                .squeeze(0)?
+                .squeeze(0)?;
+            let input = self.enricher.as_ref().unwrap().enrich(&e, &window)?;
+            let input = input.unsqueeze(0)?.unsqueeze(0)?;
+            let (attention_mask, sliding_attention_mask) =
+                self.create_attention_masks(1, 1, seqlen_offset)?;
+            let xs = self.run_layers(input, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
+            let last = xs.narrow(1, 0, 1)?;
+            let out = self.finish(last.clone())?;
+            if let Some(enr) = &mut self.enricher {
+                enr.push_state(last.squeeze(1)?.squeeze(0)?.contiguous()?);
+            }
+            let stats = FeedbackStats {
+                temperature: f64::NAN,
+                entropy: f64::NAN,
+                support: f64::NAN,
+                input_norm: f64::NAN,
+                cosine_prev: f64::NAN,
+            };
+            return Ok((out, stats));
+        }
         let (xs, stats) = self.feedback_input(logits, sampled_token)?;
         let (b_size, seq_len, _) = xs.dims3()?;
 
@@ -700,6 +834,9 @@ impl Model {
     }
 
     fn feedback_input(&mut self, logits: &Tensor, sampled_token: u32) -> Result<(Tensor, FeedbackStats)> {
+        if self.enricher.is_some() {
+            unreachable!("feedback_input is not used when the enricher is active");
+        }
         let logits_f32 = logits.to_dtype(DType::F32)?;
         let temperature = self.resolve_temperature(&logits_f32, 1)?;
         let expected = self.expected_from_logits(&logits_f32, temperature)?;
@@ -762,9 +899,11 @@ impl Model {
     }
 
     /// Prefill with prompt feedback: an observation pass builds per-position
-    /// expected embeddings from full-position logits, then one injection
-    /// pass over the blended embeddings builds the KV cache the decode loop
-    /// continues from. Returns last-position logits and summary stats.
+    /// expected embeddings from full-position logits, then `prefill_iters`
+    /// refinement iterations re-forward the blended inputs
+    /// `(1 - a) * E_prompt + a * expected(logits_{k-1})` over all positions
+    /// with fresh caches; the last iteration's cache is the one the decode
+    /// loop continues from. Returns last-position logits and summary stats.
     pub fn forward_prompt_blend(
         &mut self,
         input_ids: &Tensor,
@@ -772,17 +911,27 @@ impl Model {
         let (b_size, seq_len) = input_ids.dims2()?;
         const CHUNK: usize = 64;
         let alpha = self.feedback.prefill_blend.clamp(0.0, 1.0);
+        let iters = self.feedback.prefill_iters.max(1);
+
+        // Scaled prompt embeddings E * sqrt(h) in F32: the base input every
+        // iteration blends against. (Gather + elementwise scaling, so
+        // identical to embedding per chunk.)
+        let base = self
+            .embed_tokens
+            .forward(input_ids)?
+            .affine((self.hidden_size as f64).sqrt(), 0.0)?
+            .to_dtype(DType::F32)?;
+
+        // ---- Iteration 0: chunked observation pass. Caches accumulate
+        // across chunks and are discarded afterwards; per-chunk full-position
+        // logits yield the iteration-0 expected embeddings. ----
         let mut expected_chunks: Vec<Tensor> = Vec::new();
         let mut t_sum = 0f64;
         let mut h_sum = 0f64;
         let mut n_positions = 0usize;
         for start in (0..seq_len).step_by(CHUNK) {
             let len = CHUNK.min(seq_len - start);
-            let ids = input_ids.narrow(1, start, len)?;
-            let xs = self
-                .embed_tokens
-                .forward(&ids)?
-                .affine((self.hidden_size as f64).sqrt(), 0.0)?;
+            let xs = base.narrow(1, start, len)?;
             let (attention_mask, sliding_attention_mask) =
                 self.create_attention_masks(b_size, len, start)?;
             let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, start)?;
@@ -797,35 +946,62 @@ impl Model {
             n_positions += len;
             expected_chunks.push(self.expected_from_logits(&logits_f32, temperature)?);
         }
-        self.reset_layer_caches();
+        let stats_temperature = t_sum / (seq_len as f64 / CHUNK as f64).ceil();
+        let mut entropies = vec![h_sum / n_positions as f64];
 
-        let mut chunks = Vec::with_capacity(expected_chunks.len());
-        for (ci, expected) in expected_chunks.into_iter().enumerate() {
-            let start = ci * CHUNK;
-            let len = CHUNK.min(seq_len - start);
-            let ids = input_ids.narrow(1, start, len)?;
-            let base = self
-                .embed_tokens
-                .forward(&ids)?
-                .affine((self.hidden_size as f64).sqrt(), 0.0)?
-                .to_dtype(DType::F32)?;
-            let blended = if alpha >= 1.0 {
-                expected
+        // ---- Refinement iterations 1..=K. Each re-forwards
+        // (1 - a_p) * base + a_p * expected_{k-1} over all positions with
+        // fresh caches. Iterations before the last also produce per-position
+        // logits -> expected embeddings for the next iteration. ----
+        let mut expected = Tensor::cat(&expected_chunks, 1)?;
+        for k in 1..=iters {
+            let inputs = if alpha >= 1.0 {
+                expected.clone()
             } else {
                 (&base * (1.0 - alpha))?.broadcast_add(&(&expected * alpha)?)?
             };
-            chunks.push(blended.to_dtype(self.dtype)?);
+            self.reset_layer_caches();
+            let (attention_mask, sliding_attention_mask) =
+                self.create_attention_masks(b_size, seq_len, 0)?;
+            let xs = self.run_layers(
+                inputs.to_dtype(self.dtype)?,
+                &attention_mask,
+                &sliding_attention_mask,
+                0,
+            )?;
+            if k < iters {
+                // Per-position logits -> expected embeddings for the next
+                // iteration. (Full-sequence temperature resolution; servo
+                // targets scale with the total length.)
+                let logits_f32 = self.finish(xs)?.to_dtype(DType::F32)?;
+                let temperature = self.resolve_temperature(&logits_f32, seq_len)?;
+                let probs = candle_nn::ops::softmax_last_dim(&(&logits_f32 / temperature)?)?;
+                let logp = (&probs + 1e-12)?.log()?;
+                entropies.push(
+                    -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64)
+                        / (b_size * seq_len) as f64,
+                );
+                expected = self.expected_from_logits(&logits_f32, temperature)?;
+            } else {
+                // The decode loop continues from this iteration's cache.
+                let last = xs.narrow(1, seq_len - 1, 1)?;
+                let logits = self.finish(last.clone())?;
+                if self.enricher.is_some() {
+                    let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
+                    if let Some(enr) = &mut self.enricher {
+                        enr.push_state(state);
+                    }
+                }
+                let stats = PrefillStats {
+                    temperature: stats_temperature,
+                    entropy: entropies[0],
+                    iters,
+                    entropies,
+                };
+                return Ok((logits, stats));
+            }
         }
-        let xs = Tensor::cat(&chunks, 1)?;
-        let (attention_mask, sliding_attention_mask) =
-            self.create_attention_masks(b_size, seq_len, 0)?;
-        let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, 0)?;
-        let stats = PrefillStats {
-            temperature: if n_positions > 0 { t_sum / (seq_len as f64 / CHUNK as f64).ceil() } else { f64::NAN },
-            entropy: if n_positions > 0 { h_sum / n_positions as f64 } else { f64::NAN },
-        };
-        let logits = self.finish(xs.narrow(1, seq_len - 1, 1)?)?;
-        Ok((logits, stats))
+        unreachable!("prefill cascade loop must return at the final iteration")
     }
 
     fn reset_layer_caches(&mut self) {
@@ -834,10 +1010,92 @@ impl Model {
         }
     }
 
+    /// Attach a trained enricher (inference); replaces the softmax-blend
+    /// decode feedback with the learned attention-pooling enrichment.
+    pub fn set_enricher(&mut self, enr: crate::enrich::Enricher) {
+        self.enricher = Some(enr);
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Scaled input embeddings E[tokens] * sqrt(h) in F32, pad positions
+    /// zeroed (for the training forward).
+    pub fn embed_scale(&self, input_ids: &Tensor, lens: &[usize]) -> Result<Tensor> {
+        let (b, seq) = input_ids.dims2()?;
+        let e = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
+        let e = e.affine((self.hidden_size as f64).sqrt(), 0.0)?;
+        let mask_data: Vec<f32> = (0..b)
+            .flat_map(|r| {
+                (0..seq).map(move |j| if j < lens[r] { 1.0f32 } else { 0.0 })
+            })
+            .collect();
+        let mask = Tensor::from_vec(mask_data, (b, seq, 1), &self.device)?;
+        Ok(e.broadcast_mul(&mask)?)
+    }
+
+    /// Raw (unscaled) embedding row of a single token, shape [hidden], F32.
+    pub fn embed_one(&self, token: &Tensor) -> Result<Tensor> {
+        Ok(self
+            .embed_tokens
+            .forward(token)?
+            .to_dtype(DType::F32)?
+            .squeeze(0)?)
+    }
+
+    /// Expected embedding probs @ E * sqrt(h) from a probability vector
+    /// [1, vocab]; returns [1, hidden] in F32.
+    pub fn expected_from_probs(&self, probs: &Tensor) -> Result<Tensor> {
+        let xs = probs.matmul(self.embed_tokens.embeddings())?;
+        Ok(xs
+            .affine((self.hidden_size as f64).sqrt(), 0.0)?
+            .to_dtype(DType::F32)?)
+    }
+
+    /// Cache-free, pad-aware training forward over caller-built input
+    /// embeddings (batch, seq, hidden). Returns the final residual states
+    /// for all positions and the logits for the answer range
+    /// [answer_start, answer_start + answer_len).
+    pub fn forward_inputs_train(
+        &self,
+        xs: &Tensor,
+        lens: &[usize],
+        answer_start: usize,
+        answer_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b_size, seq_len, _) = xs.dims3()?;
+        let full_mask = prepare_train_mask(b_size, seq_len, lens, None, self.dtype, &self.device)?;
+        let slide_mask = prepare_train_mask(
+            b_size,
+            seq_len,
+            lens,
+            Some(self.sliding_window),
+            self.dtype,
+            &self.device,
+        )?;
+        let mut h = xs.clone();
+        for layer in self.layers.iter() {
+            let mask = if layer.sliding_window.is_some() {
+                &slide_mask
+            } else {
+                &full_mask
+            };
+            h = layer.forward_train(&h, mask)?;
+        }
+        let states = h.clone();
+        let answer_states = h.narrow(1, answer_start, answer_len)?;
+        let logits = self.finish(answer_states)?;
+        Ok((states, logits))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.reset_layer_caches();
         self.heuristic_t = self.feedback.temperature;
         self.last_input = None;
+        if let Some(enr) = &mut self.enricher {
+            enr.clear_states();
+        }
     }
 
     pub fn probe(&mut self, token: u32) -> Result<ProbeOut> {        let row = self

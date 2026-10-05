@@ -332,6 +332,70 @@ Bench round 2 (same protocol as Finding 6, greedy, paired, N=100/40):
   (see ENRICHER.md), which starts at exact baseline (zero-init injection)
   and learns when and how much to enrich.
 
+## Finding 8: iterated prefill cascade at gentle strength improves induction (+18, p=0.006) without collateral damage
+
+Implementation: `--prefill-feedback-iters K` (Schedule B from ENRICHER.md).
+Iteration 0 is the existing observation pass; iterations k = 1..K re-forward
+`(1 - a_p) * E_prompt + a_p * expected(logits_{k-1})` over all positions
+with fresh caches; decode continues from iteration K's cache. Cost:
+(K+1) full prefills. K=1 reproduces the old `prefill-p0.5` bit-exactly
+(regression battery passed).
+
+Dynamics probe (long France paragraph, greedy; step-1 raw_H, baseline 1.10):
+
+| config | raw_H | continuation |
+|---|---|---|
+| K=1, a_p=0.25 | 0.21 | "The capital of France…" (healthy) |
+| K=2, a_p=0.25 | 0.35 | healthy |
+| K=3, a_p=0.25 | 0.71 | ≈ baseline text |
+| K=1, a_p=0.50 | 5.50 | destroyed (Finding 7) |
+| K=2, a_p=0.50 | 4.19 | destroyed (worse than K=1) |
+| K=3, a_p=0.50 | 3.21 | repaired: "The capital of France is Paris." |
+
+Bench (greedy, paired, tasks digits-5/10 + induce; triage N=25, confirm
+N=100/50 for the winning config):
+
+| task | baseline | prefill-p0.5 | cascade-k2 a.5 | cascade-k3 a.5 | cascade-k2 a.25 |
+|------|----------|--------------|----------------|----------------|-----------------|
+| digits-5  | 100% | 0% | 8%  | 4% | 88% → 94% (conf., p=0.250) |
+| digits-10 | 96%  | 0% | 52% | 0% | 84% → 88% (conf., p=0.219) |
+| induce    | 64% (60 conf.) | 4% | 12% | 4% | 80% → **78% (conf., p=0.006)** |
+| trivia (conf.) | 72% | — | — | — | 72% (p=1.000) |
+
+Interpretation:
+
+- **Strength dominates depth.** At a_p=0.5 the lookahead injection
+  compounds: K=2 is worse than K=1 and K=3 only turns the *dynamics*
+  around (not the bench). At a_p=0.25 the cascade is uniformly safe at all
+  K probed.
+- **The iterated cascade at gentle strength is the first prompt-side
+  mechanism that *improves* ICL**: induce 78% vs 60% baseline
+  (+18, p=0.006, N=100), also above blend-d0.5 (56%). Each prompt position
+  receives 25% of the previous iteration's expected continuation of its
+  own output while the exact token keys stay anchored at 75% — the
+  induction head keeps its precise keys and gains anticipatory context.
+- digits/trivia essentially unharmed (digits-5 94% / digits-10 88% vs
+  100/96, both ns at N=50; trivia identical). Watch item: induce mean
+  generated length rose (6.5 vs 3.8 tokens — some answers run past the
+  number before EOS).
+- This is an inference-only effect (no training) measured with the
+  hand-set blend operator; the learned per-step gate (ENRICHER.md) is
+  expected to own the strength schedule — the a_p=0.5 destruction shows
+  fixed strength cannot be rescued by depth alone.
+
+Reproduce:
+
+```sh
+# dynamics probe (per-step CSV on stderr)
+cargo run --release -- --cpu -p "<long France paragraph>" -n 40 --seed 7 \
+    --temperature 0 --debug-logits --softmax-feedback-diagnostics \
+    --prefill-feedback-blend 0.25 --prefill-feedback-iters 2
+
+# bench (cascade modes; filters select the subset)
+cargo run --release -- --cpu --bench --bench-n 100 --bench-tasks induce,trivia \
+    --bench-modes baseline,cascade-k2-a25 --bench-out logs/cascade_confirm_induce.csv
+```
+
 ## Example commands
 
 ```sh
