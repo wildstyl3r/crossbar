@@ -345,6 +345,12 @@ pub fn run_bench(
             decode: true,
             prefill: false,
         });
+        modes.push(BenchMode {
+            label: "enricher-cascade-k2-a25",
+            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.25, 2)),
+            decode: true,
+            prefill: true,
+        });
     } else {
         modes.push(BenchMode {
             label: "blend-d0.5",
@@ -420,7 +426,7 @@ pub fn run_bench(
             .feedback
             .unwrap_or_else(|| fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.0, 1));
         let mut engine = (make_engine)(feedback)?;
-        if mode.label == "enricher" {
+        if mode.label.starts_with("enricher") {
             if let Some(path) = enricher_path {
                 engine.set_enricher(path, 192, 8)?;
                 println!("  enricher: loaded from {path}");

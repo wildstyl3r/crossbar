@@ -773,7 +773,7 @@ impl Model {
                 .forward(&token)?
                 .squeeze(0)?
                 .squeeze(0)?;
-            let input = self.enricher.as_ref().unwrap().enrich(&e, &window)?;
+            let input = self.enricher.as_ref().unwrap().enrich(&e, &window)?.0;
             let input = input.unsqueeze(0)?.unsqueeze(0)?;
             let (attention_mask, sliding_attention_mask) =
                 self.create_attention_masks(1, 1, seqlen_offset)?;

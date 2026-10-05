@@ -43,7 +43,7 @@ const NAMES: [&str; 6] = [
 ];
 
 impl Enricher {
-    pub fn new(hidden: usize, r: usize, capacity: usize, device: &Device) -> CResult<Self> {
+    pub fn new(hidden: usize, r: usize, capacity: usize, gate_bias: f64, device: &Device) -> CResult<Self> {
         use candle_nn::init::Init;
         let varmap = candle_nn::VarMap::new();
         let scale = (hidden as f64).sqrt();
@@ -85,7 +85,7 @@ impl Enricher {
         let gate_b_var = varmap.get(
             1,
             NAMES[5],
-            Init::Const(2.),
+            Init::Const(gate_bias),
             DType::F32,
             &Device::Cpu,
         )?;
@@ -187,12 +187,16 @@ impl Enricher {
     /// The learnable enrichment: `e * sqrt(h) + g * W_o(attend(states))`.
     /// Functional form (explicit state window) used both at inference and
     /// during training; `e` is the raw embedding row [hidden] and the
-    /// Gemma embedding scale is applied here.
-    pub fn enrich(&self, e: &Tensor, window: &[Tensor]) -> CResult<Tensor> {
+    /// Gemma embedding scale is applied here. Returns the enriched input
+    /// and the *applied* relative injection energy
+    /// `||g * W_o(pooled)||^2 / ||e * sqrt(h)||^2` (a scalar tensor, for
+    /// the training-time magnitude penalty; meaningless at inference).
+    pub fn enrich(&self, e: &Tensor, window: &[Tensor]) -> CResult<(Tensor, Tensor)> {
         let scale = (self.hidden as f64).sqrt();
         let q = e.to_dtype(DType::F32)?.affine(scale, 0.0)?.reshape((1, self.hidden))?;
         if window.is_empty() {
-            return Ok(q.reshape((self.hidden,))?);
+            let zero = Tensor::new(&[0.0f32], &Device::Cpu)?;
+            return Ok((q.reshape((self.hidden,))?, zero));
         }
         let hs = Tensor::cat(window, D::Minus1)?.reshape((window.len(), self.hidden))?;
         let keys = hs.matmul(&self.w_k)?; // [n, r]
@@ -218,8 +222,13 @@ impl Enricher {
             self.gate_sum.get() + gate.flatten_all()?.to_vec1::<f32>()?[0] as f64,
         );
         self.gate_n.set(self.gate_n.get() + 1);
-        let out = injected.broadcast_mul(&gate)?.squeeze(0)?;
-        (q.squeeze(0)? + out)?.reshape((self.hidden,))
+        let applied = injected.broadcast_mul(&gate)?; // [1, hidden]
+        let rel_inj_sq = applied
+            .sqr()?
+            .sum_all()?
+            .broadcast_div(&q.sqr()?.sum_all()?)?; // scalar
+        let out = (q.squeeze(0)? + applied.squeeze(0)?)?.reshape((self.hidden,))?;
+        Ok((out, rel_inj_sq))
     }
 
     /// Mean gate value since the last call (monitoring).

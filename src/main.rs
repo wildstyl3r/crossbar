@@ -178,6 +178,49 @@ struct Args {
     /// Where the trained enricher checkpoint is written / reloaded from.
     #[arg(long, default_value = "enricher.safetensors")]
     train_out: String,
+
+    /// Initial gate bias of a fresh enricher (0 => sigmoid 0.5, run-2
+    /// recipe; run 4 used +2.0).
+    #[arg(long, default_value_t = 0.0)]
+    train_gate_bias: f64,
+
+    /// Linear lr ramp length (steps) at the start of warmup (0 = constant
+    /// lr, run-2 recipe; run 4 used 50).
+    #[arg(long, default_value_t = 0)]
+    train_lr_warmup: usize,
+
+    /// Gate floor during warmup (0 = none, run-2 recipe; run 4 used 0.5).
+    /// The ST phase anneals a floor of 0.6 * this -> 0.
+    #[arg(long, default_value_t = 0.0)]
+    train_gate_floor: f64,
+
+    /// Starting Gumbel temperature of the ST phase (annealed linearly to
+    /// --train-gt-end; run-2 recipe 1.0, post-run-2 code 0.5).
+    #[arg(long, default_value_t = 1.0)]
+    train_gt_start: f64,
+
+    /// Anneal target of the ST sampling temperature (0.1 ~= the greedy
+    /// deployment regime).
+    #[arg(long, default_value_t = 0.1)]
+    train_gt_end: f64,
+
+    /// Relative injection penalty weight: loss + lambda * mean(
+    /// ||g*W_o(pooled)||^2 / ||e*sqrt(h)||^2 ). 0 disables.
+    #[arg(long, default_value_t = 0.1)]
+    train_inj_l2: f64,
+
+    /// Seed for the training-data shuffle and the ST sampling rng.
+    #[arg(long, default_value_t = 31337)]
+    train_seed: u64,
+
+    /// Skip the terminal evaluation (smoke runs).
+    #[arg(long)]
+    train_skip_eval: bool,
+
+    /// Probe a trained enricher checkpoint (--train-out) for the ST
+    /// soft-mixture artifact instead of training.
+    #[arg(long)]
+    train_probe: bool,
 }
 
 enum Engine {
@@ -443,6 +486,16 @@ fn main() -> Result<()> {
         std::fs::read_to_string(resolve_file(model_dir, fallback_dir, "chat_template.jinja")?)?;
 
     if args.train_enricher {
+        if args.train_probe {
+            train::run_probe(
+                &engine,
+                &tokenizer,
+                &chat_template,
+                &device,
+                &args.train_out,
+            )?;
+            return Ok(());
+        }
         train::run(
             &mut engine,
             &tokenizer,
@@ -451,6 +504,16 @@ fn main() -> Result<()> {
             args.train_steps_warmup,
             args.train_steps_st,
             &args.train_out,
+            train::TrainConfig {
+                gate_bias: args.train_gate_bias,
+                lr_warmup: args.train_lr_warmup,
+                gate_floor: args.train_gate_floor,
+                gt_start: args.train_gt_start,
+                gt_end: args.train_gt_end,
+                inj_l2: args.train_inj_l2,
+                seed: args.train_seed,
+                skip_eval: args.train_skip_eval,
+            },
         )?;
         return Ok(());
     }

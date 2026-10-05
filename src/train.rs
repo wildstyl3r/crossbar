@@ -15,6 +15,37 @@ const K: usize = 8;
 const TRAIN_PAIRS: usize = 2000;
 const HELDOUT_PAIRS: usize = 100;
 
+/// Training hyperparameters. Defaults restore the run-2 recipe (the only
+/// one that ever converged): constant warmup lr, no gate floor, gate bias
+/// 0, Gumbel temperature annealed 1.0 -> 0.3.
+pub struct TrainConfig {
+    /// Initial gate bias of a fresh enricher (0 => sigmoid 0.5; run 4 used
+    /// +2.0).
+    pub gate_bias: f64,
+    /// Linear lr ramp length at the start of warmup (0 = constant; run 4
+    /// used 50).
+    pub lr_warmup: usize,
+    /// Gate floor during warmup (0 = none; run 4 used 0.5). The ST phase
+    /// anneals a floor of 0.6 * gate_floor -> 0.
+    pub gate_floor: f64,
+    /// Starting Gumbel temperature of the ST phase, annealed linearly to
+    /// `gt_end` (run 2: 1.0 over 300 steps; post-run-2 code: 0.5).
+    pub gt_start: f64,
+    /// Anneal target of the ST sampling temperature (0.1 ~= the greedy
+    /// deployment regime).
+    pub gt_end: f64,
+    /// Relative injection penalty: `loss + inj_l2 * mean(
+    /// ||g * W_o(pooled)||^2 / ||e*sqrt(h)||^2 )`. The probe on the run-5
+    /// checkpoint showed the unpenalized injection reaching ~131x the input
+    /// norm (the module replaced the token identity with pooled states);
+    /// useful hand-set enrichments live at O(0.25-1)x.
+    pub inj_l2: f64,
+    /// Seed for the training-data shuffle and the ST sampling rng.
+    pub seed: u64,
+    /// Skip the terminal evaluation (smoke runs).
+    pub skip_eval: bool,
+}
+
 pub struct Example {
     pub task: &'static str,
     pub prompt: String,
@@ -268,10 +299,151 @@ fn gumbel_softmax(
     Tensor::from_vec(probs, logits.len(), device)
 }
 
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let na: f64 = a.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    dot / (na * nb).max(1e-12)
+}
+
+/// Probe a trained enricher checkpoint: quantify the ST soft-mixture
+/// artifact (did the module learn to denoise Gumbel mixtures toward the
+/// clean token embedding?) and the deployment-relevant distortion of clean
+/// inputs. Prints mean statistics over answer slots of a few held-out
+/// batches:
+/// - c_in:  cos(e_mix, e_clean) — input smear at the given gumbel temp;
+/// - c_st:  cos(enrich(e_mix), e_clean) — st path output vs clean (the
+///          denoising signal is c_st > c_in);
+/// - c_dep: cos(enrich(e_clean), e_clean) — deployment case (want ~1.0);
+/// - inj:   ||enrich(e_clean) - e_clean*sqrt(h)|| / ||e_clean*sqrt(h)||;
+/// - scale: ||e_mix_scaled|| / ||e_clean_raw|| (the double-sqrt(h) factor
+///          shows up as ~sqrt(hidden) for peaked mixtures).
+pub fn run_probe(
+    engine: &Engine,
+    tokenizer: &Tokenizer,
+    chat_template: &str,
+    device: &Device,
+    checkpoint: &str,
+) -> Result<()> {
+    let heldout = build_dataset().1;
+    let batches = make_batches(&heldout, tokenizer, chat_template, 8)?;
+    let enr = Enricher::load(checkpoint, engine.hidden(), R, K)?;
+    let mut sample_rng = StdRng::seed_from_u64(999);
+    let n_batches = batches.len().min(5);
+    println!(
+        "probe: checkpoint {checkpoint}, {n_batches} held-out batches, r={R} k={K}"
+    );
+    for &gt in &[1.0f64, 0.3] {
+        let mut c_in_sum = 0f64;
+        let mut c_st_sum = 0f64;
+        let mut c_dep_sum = 0f64;
+        let mut inj_sum = 0f64;
+        let mut scale_sum = 0f64;
+        let mut gate_st_sum = 0f64;
+        let mut gate_dep_sum = 0f64;
+        let mut n = 0usize;
+        for batch in batches.iter().take(n_batches) {
+            let (states, pass_a_logits) = engine.forward_inputs_train(
+                &engine.embed_scale(&batch.input_ids, &batch.lens)?,
+                &batch.lens,
+                batch.answer_start,
+                batch.answer_len,
+            )?;
+            let logits_v = pass_a_logits.to_dtype(DType::F32)?.to_vec3::<f32>()?;
+            for row in 0..batch.lens.len() {
+                for slot in 0..batch.valid[row] {
+                    let pos = batch.answer_start + slot;
+                    let mut window: Vec<Tensor> = Vec::new();
+                    for j in pos.saturating_sub(K)..pos {
+                        if j < batch.lens[row] {
+                            let st = states
+                                .narrow(0, row, 1)?
+                                .narrow(1, j, 1)?
+                                .squeeze(1)?
+                                .squeeze(0)?
+                                .contiguous()?;
+                            window.push(st);
+                        }
+                    }
+                    let probs = gumbel_softmax(&logits_v[row][slot], gt, &mut sample_rng, device)?;
+                    let idx = probs.argmax(0)?.to_scalar::<u32>()?;
+                    let tok = Tensor::new(&[idx], &Device::Cpu)?;
+                    let e_clean_raw = engine.embed_one(&tok)?; // [hidden], unscaled
+                    let e_mix = engine
+                        .expected_from_probs(&probs.unsqueeze(0)?)? // scaled by sqrt(h)
+                        .squeeze(0)?
+                        .to_vec1::<f32>()?;
+                    let e_clean_v = e_clean_raw.to_vec1::<f32>()?;
+
+                    // ST path exactly as trained: pre-scaled mixture in.
+                    let (y_st, _pen_st) = enr.enrich(
+                        &Tensor::from_vec(e_mix.clone(), e_mix.len(), device)?,
+                        &window,
+                    )?;
+                    let y_st = y_st.to_vec1::<f32>()?;
+                    let gate_st = enr.take_gate_mean().unwrap_or(f64::NAN);
+                    // Deployment path: raw clean embedding in.
+                    let (y_dep, _pen_dep) = enr.enrich(&e_clean_raw, &window)?;
+                    let y_dep = y_dep.to_vec1::<f32>()?;
+                    let gate_dep = enr.take_gate_mean().unwrap_or(f64::NAN);
+
+                    let norm = |v: &[f32]| v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+                    let e_norm = norm(&e_clean_v);
+                    let c_in = cosine(&e_mix, &e_clean_v);
+                    let c_st = cosine(&y_st, &e_clean_v);
+                    let c_dep = cosine(&y_dep, &e_clean_v);
+                    let e_scaled_norm = e_norm * (engine.hidden() as f64).sqrt();
+                    let inj = {
+                        let d: Vec<f32> = y_dep
+                            .iter()
+                            .zip(&e_clean_v)
+                            .map(|(y, e)| y - (*e as f32) * (engine.hidden() as f32).sqrt())
+                            .collect();
+                        norm(&d) / e_scaled_norm.max(1e-9)
+                    };
+                    let scale = norm(&e_mix) / e_norm.max(1e-9);
+
+                    c_in_sum += c_in;
+                    c_st_sum += c_st;
+                    c_dep_sum += c_dep;
+                    inj_sum += inj;
+                    scale_sum += scale;
+                    if gate_st.is_finite() {
+                        gate_st_sum += gate_st;
+                    }
+                    if gate_dep.is_finite() {
+                        gate_dep_sum += gate_dep;
+                    }
+                    n += 1;
+                }
+            }
+        }
+        let n = n.max(1) as f64;
+        let (c_in, c_st, c_dep, inj, scale) = (
+            c_in_sum / n,
+            c_st_sum / n,
+            c_dep_sum / n,
+            inj_sum / n,
+            scale_sum / n,
+        );
+        let (gate_st, gate_dep) = (gate_st_sum / n, gate_dep_sum / n);
+        println!(
+            "probe gt={gt:.2}: c_in {c_in:.3} -> c_st {c_st:.3} (denoise {:+.3}) | c_dep {c_dep:.3} | inj {inj:.3} | scale {scale:.2} | gate st {gate_st:.3} dep {gate_dep:.3} (n={:.0})",
+            c_st - c_in,
+            n
+        );
+    }
+    Ok(())
+}
+
 /// Build the enriched answer-slot input embeddings for a batch from
 /// Pass-A states. `gumbel` (pass_a_logits [b, A, V], temperature) replaces
-/// the teacher-forced token embedding with the straight-through soft
-/// mixture.
+/// the teacher-forced token embedding with the exact embedding of one
+/// *sampled* token (hard forward; the sampled index comes from the
+/// Gumbel-softmax of the Pass-A logits at temperature `gt`) — matching the
+/// deployment input distribution. Returns the batch inputs and the mean
+/// relative injection energy `||g * W_o(pooled)||^2 / ||e * sqrt(h)||^2`
+/// over the batch's answer slots (for the training-time penalty).
 fn enriched_inputs(
     engine: &Engine,
     enr: &Enricher,
@@ -280,11 +452,12 @@ fn enriched_inputs(
     gumbel: Option<(&Tensor, f64)>,
     device: &Device,
     rng: &mut StdRng,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Tensor)> {
     let b = batch.lens.len();
     let (_, seq_len) = batch.input_ids.dims2()?;
     let base = engine.embed_scale(&batch.input_ids, &batch.lens)?;
     let mut rows: Vec<Tensor> = Vec::with_capacity(b);
+    let mut pens: Vec<Tensor> = Vec::new();
     for row in 0..b {
         let mut row_base = base.narrow(0, row, 1)?.squeeze(0)?; // [seq, hidden]
         for slot in 0..batch.valid[row] {
@@ -310,7 +483,8 @@ fn enriched_inputs(
                         .squeeze(0)?
                         .to_vec1::<f32>()?;
                     let probs = gumbel_softmax(&lg, *gt, rng, device)?;
-                    engine.expected_from_probs(&probs.unsqueeze(0)?)?.squeeze(0)?
+                    let idx = probs.argmax(0)?.to_scalar::<u32>()?;
+                    engine.embed_one(&Tensor::new(&[idx], device)?)?
                 }
                 None => {
                     let tok = batch
@@ -322,7 +496,8 @@ fn enriched_inputs(
                     engine.embed_one(&tok)?
                 }
             };
-            let enriched = enr.enrich(&e, &window)?; // [hidden]
+            let (enriched, pen) = enr.enrich(&e, &window)?; // [hidden], scalar
+            pens.push(pen);
             let left = row_base.narrow(0, 0, pos)?;
             let right = row_base.narrow(0, pos + 1, seq_len - pos - 1)?;
             let mid = enriched.unsqueeze(0)?;
@@ -331,7 +506,13 @@ fn enriched_inputs(
         rows.push(row_base);
     }
     let refs: Vec<&Tensor> = rows.iter().collect();
-    Ok(Tensor::stack(&refs, 0)?)
+    let inputs = Tensor::stack(&refs, 0)?;
+    let pen = if pens.is_empty() {
+        Tensor::new(&[0.0f32], device)?
+    } else {
+        Tensor::stack(&pens, 0)?.mean_all()?
+    };
+    Ok((inputs, pen))
 }
 
 fn masked_ce(logits: &Tensor, targets: &Tensor, device: &Device) -> Result<Tensor> {
@@ -376,10 +557,11 @@ pub fn run(
     warmup_steps: usize,
     st_steps: usize,
     out_path: &str,
+    cfg: TrainConfig,
 ) -> Result<()> {
     println!("train: building dataset ({TRAIN_PAIRS} train / {HELDOUT_PAIRS} held-out pairs)...");
     let (mut train_examples, heldout) = build_dataset();
-    let mut rng = StdRng::seed_from_u64(31337);
+    let mut rng = StdRng::seed_from_u64(cfg.seed);
     shuffle(&mut train_examples, &mut rng);
 
     let mut enr = match std::path::Path::new(out_path).exists() {
@@ -387,13 +569,16 @@ pub fn run(
             println!("train: resuming from existing checkpoint {out_path}");
             Enricher::load(out_path, engine.hidden(), R, K)?
         }
-        false => Enricher::new(engine.hidden(), R, K, &Device::Cpu)?,
+        false => Enricher::new(engine.hidden(), R, K, cfg.gate_bias, &Device::Cpu)?,
     };
     let vars = enr.vars();
     let mut opt = candle_nn::AdamW::new_lr(vars, 1e-3)?;
-    println!("train: enricher r={R} k={K}");
+    println!(
+        "train: enricher r={R} k={K} (bias {:.2}, lr_warmup {}, floor {:.2}, gt_start {:.2}, seed {})",
+        cfg.gate_bias, cfg.lr_warmup, cfg.gate_floor, cfg.gt_start, cfg.seed
+    );
 
-    let mut sample_rng = StdRng::seed_from_u64(555);
+    let mut sample_rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(1));
     let batches = make_batches(&train_examples, tokenizer, chat_template, 8)?;
     let eval_batches = make_batches(&heldout, tokenizer, chat_template, 8)?;
     let eval_examples = heldout;
@@ -402,14 +587,23 @@ pub fn run(
     let start = std::time::Instant::now();
     let mut last_checkpoint = start;
     let mut loss_sum = 0f64;
+    let mut pen_sum = 0f64;
     let mut loss_n = 0usize;
+    let mut low_gate_prints = 0usize;
 
-    enr.set_gate_floor(0.5);
-    println!("train: CE warmup for {warmup_steps} steps (gate floor 0.5)");
+    enr.set_gate_floor(cfg.gate_floor);
+    println!(
+        "train: CE warmup for {warmup_steps} steps (gate floor {:.2})",
+        cfg.gate_floor
+    );
     for wi in 0..warmup_steps {
         let batch = &batches[wi % total_batches];
         let decay = 1.0 - 0.5 * (wi as f64 / warmup_steps.max(1) as f64);
-        let warm = (wi as f64 / 50.0).min(1.0);
+        let warm = if cfg.lr_warmup > 0 {
+            (wi as f64 / cfg.lr_warmup as f64).min(1.0)
+        } else {
+            1.0
+        };
         let lr = 1e-3 * decay * warm;
         opt.set_learning_rate(lr);
         let (states, _) = engine.forward_inputs_train(
@@ -418,35 +612,59 @@ pub fn run(
             batch.answer_start,
             batch.answer_len,
         )?;
-        let inputs = enriched_inputs(engine, &enr, batch, &states, None, device, &mut sample_rng)?;
+        let (inputs, pen) =
+            enriched_inputs(engine, &enr, batch, &states, None, device, &mut sample_rng)?;
         let (_, pass_b_logits) =
             engine.forward_inputs_train(&inputs, &batch.lens, batch.answer_start, batch.answer_len)?;
-        let loss = masked_ce(&pass_b_logits, &batch.targets, device)?;
+        let mut loss = masked_ce(&pass_b_logits, &batch.targets, device)?;
+        let pen_v = pen.to_scalar::<f32>()? as f64;
+        if cfg.inj_l2 > 0.0 {
+            loss = (loss + (pen * cfg.inj_l2)?)?;
+        }
         opt.backward_step(&loss)?;
         loss_sum += loss.to_scalar::<f32>()? as f64;
+        pen_sum += pen_v;
         loss_n += 1;
         if wi % 10 == 0 {
+            let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
             println!(
-                "  warmup {wi:>4}: loss {:.4} (lr {:.2e}, gate {:.3}) [{:.0}s]",
+                "  warmup {wi:>4}: loss {:.4} (lr {:.2e}, gate {:.3}, inj_l2 {:.3}) [{:.0}s]",
                 loss_sum / loss_n.max(1) as f64,
                 lr,
-                enr.take_gate_mean().unwrap_or(f64::NAN),
+                gm,
+                pen_sum / loss_n.max(1) as f64,
                 start.elapsed().as_secs_f64()
             );
             loss_sum = 0.0;
+            pen_sum = 0.0;
             loss_n = 0;
+            if gm.is_finite() && gm < 0.05 {
+                low_gate_prints += 1;
+            } else {
+                low_gate_prints = 0;
+            }
+            if low_gate_prints >= 6 {
+                let forensic = format!("{out_path}.collapsed");
+                enr.save(&forensic)?;
+                anyhow::bail!(
+                    "gate collapsed (mean < 0.05 for 60 consecutive steps); state saved to {forensic}"
+                );
+            }
         }
         maybe_checkpoint(&mut enr, &mut last_checkpoint, out_path)?;
     }
 
-    // Gentler ST transition: keep an annealed gate floor (0.3 -> 0) and a
-    // lower starting gumbel temperature; the teacher-forced -> soft-mixture
-    // shift was shown to re-trigger gate collapse (run 4, st 0-10).
+    // Gentler ST transition: keep an annealed gate floor (0.6 * warmup
+    // floor -> 0) and an annealed Gumbel temperature; the teacher-forced ->
+    // soft-mixture shift was shown to re-trigger gate collapse (run 4,
+    // st 0-10).
     println!("train: guided ST-Gumbel for {st_steps} steps");
     for si in 0..st_steps {
-        let floor = 0.3 * (1.0 - si as f64 / st_steps.max(1) as f64);
+        let floor = (cfg.gate_floor * 0.6) * (1.0 - si as f64 / st_steps.max(1) as f64);
         enr.set_gate_floor(floor);
-        let gt = (0.5 - 0.2 * si as f64 / st_steps.max(1) as f64).max(0.3);
+        let gt =
+            (cfg.gt_start - (cfg.gt_start - cfg.gt_end) * si as f64 / st_steps.max(1) as f64)
+                .max(cfg.gt_end);
         let batch = &batches[si % total_batches];
         let lr = 1e-4 + 5e-4 * (1.0 - 0.5 * (si as f64 / st_steps.max(1) as f64));
         opt.set_learning_rate(lr);
@@ -456,7 +674,7 @@ pub fn run(
             batch.answer_start,
             batch.answer_len,
         )?;
-        let inputs = enriched_inputs(
+        let (inputs, pen) = enriched_inputs(
             engine,
             &enr,
             batch,
@@ -467,37 +685,77 @@ pub fn run(
         )?;
         let (_, pass_b_logits) =
             engine.forward_inputs_train(&inputs, &batch.lens, batch.answer_start, batch.answer_len)?;
-        let loss = masked_ce(&pass_b_logits, &batch.targets, device)?;
+        let mut loss = masked_ce(&pass_b_logits, &batch.targets, device)?;
+        let pen_v = pen.to_scalar::<f32>()? as f64;
+        if cfg.inj_l2 > 0.0 {
+            loss = (loss + (pen * cfg.inj_l2)?)?;
+        }
         opt.backward_step(&loss)?;
         loss_sum += loss.to_scalar::<f32>()? as f64;
+        pen_sum += pen_v;
         loss_n += 1;
         if si % 10 == 0 {
+            let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
             println!(
-                "  st {si:>4}: loss {:.4} (lr {:.2e}, gt {gt:.2}, gate {:.3}) [{:.0}s]",
+                "  st {si:>4}: loss {:.4} (lr {:.2e}, gt {gt:.2}, gate {:.3}, inj_l2 {:.3}) [{:.0}s]",
                 loss_sum / loss_n.max(1) as f64,
                 lr,
-                enr.take_gate_mean().unwrap_or(f64::NAN),
+                gm,
+                pen_sum / loss_n.max(1) as f64,
                 start.elapsed().as_secs_f64()
             );
             loss_sum = 0.0;
+            pen_sum = 0.0;
             loss_n = 0;
+            if gm.is_finite() && gm < 0.05 {
+                low_gate_prints += 1;
+            } else {
+                low_gate_prints = 0;
+            }
+            if low_gate_prints >= 6 {
+                let forensic = format!("{out_path}.collapsed");
+                enr.save(&forensic)?;
+                anyhow::bail!(
+                    "gate collapsed (mean < 0.05 for 60 consecutive steps); state saved to {forensic}"
+                );
+            }
         }
         maybe_checkpoint(&mut enr, &mut last_checkpoint, out_path)?;
+    }
+
+    if cfg.skip_eval {
+        enr.save(out_path)?;
+        println!("train: saved enricher to {out_path} (eval skipped)");
+        return Ok(());
     }
 
     println!("train: held-out evaluation");
     let base_tf = teacher_forced_em(engine, &eval_batches, device, None)?;
     let trained_tf = teacher_forced_em(engine, &eval_batches, device, Some(&enr))?;
-    println!("train: teacher-forced EM: baseline {:.1}% -> trained {:.1}%", 100.0 * base_tf, 100.0 * trained_tf);
+    println!(
+        "train: teacher-forced EM: baseline {:.1}% -> trained {:.1}%",
+        100.0 * base_tf,
+        100.0 * trained_tf
+    );
     enr.save(out_path)?;
     println!("train: saved enricher to {out_path}");
 
-    let fresh = Enricher::new(engine.hidden(), R, K, &Device::Cpu)?;
+    let fresh = Enricher::new(engine.hidden(), R, K, 0.0, &Device::Cpu)?;
     engine.attach_enricher(fresh)?;
-    let base_fr = free_running_eval(engine, tokenizer, chat_template, &eval_examples, device)?;
+    let base_fr = free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, false)?;
+    let base_fr_guided =
+        free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, true)?;
     engine.attach_enricher(enr)?;
-    let trained_fr = free_running_eval(engine, tokenizer, chat_template, &eval_examples, device)?;
-    println!("train: free-running EM: baseline {:.1}% -> trained {:.1}%", 100.0 * base_fr, 100.0 * trained_fr);
+    let trained_fr = free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, false)?;
+    let trained_fr_guided =
+        free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, true)?;
+    println!(
+        "train: free-running EM: baseline {:.1}% -> trained {:.1}% (first-token-guided: baseline {:.1}% -> trained {:.1}%)",
+        100.0 * base_fr,
+        100.0 * trained_fr,
+        100.0 * base_fr_guided,
+        100.0 * trained_fr_guided
+    );
     Ok(())
 }
 
@@ -523,7 +781,8 @@ fn teacher_forced_em(
             None => pass_a_logits,
             Some(enr) => {
                 let mut rng = StdRng::seed_from_u64(1);
-                let inputs = enriched_inputs(engine, enr, batch, &states, None, device, &mut rng)?;
+                let (inputs, _) =
+                    enriched_inputs(engine, enr, batch, &states, None, device, &mut rng)?;
                 let (_, l) = engine.forward_inputs_train(
                     &inputs,
                     &batch.lens,
@@ -551,13 +810,17 @@ fn teacher_forced_em(
 }
 
 /// Free-running greedy decode over held-out examples with the enricher
-/// attached (states buffer maintained by the model itself).
+/// attached (states buffer maintained by the model itself). With
+/// `guided_first` the first answer token is teacher-forced from the target
+/// (a diagnostic that separates first-step bootstrap failures from
+/// free-running destabilization — run 2's loop attractors).
 fn free_running_eval(
     engine: &mut Engine,
     tokenizer: &Tokenizer,
     chat_template: &str,
     examples: &[Example],
     device: &Device,
+    guided_first: bool,
 ) -> Result<f64> {
     let end_of_turn = tokenizer
         .token_to_id("<end_of_turn>")
@@ -571,23 +834,38 @@ fn free_running_eval(
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+        let forced_first = if guided_first {
+            Some(
+                tokenizer
+                    .encode(ex.answer.as_str(), false)
+                    .map_err(E::msg)?
+                    .get_ids()[0],
+            )
+        } else {
+            None
+        };
         engine.clear_kv_cache();
         let input = Tensor::from_vec(prompt_tokens.clone(), (1, prompt_tokens.len()), device)?;
         let mut logits = engine.forward(&input, 0)?;
         let mut text = String::new();
         let mut pos = prompt_tokens.len();
-        for _ in 0..8 {
+        for step in 0..8 {
             let lg = logits
                 .squeeze(0)?
                 .squeeze(0)?
                 .to_dtype(DType::F32)?
                 .to_vec1::<f32>()?;
-            let best = lg
+            let argmax = lg
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(&b.1))
                 .unwrap()
                 .0 as u32;
+            let best = if step == 0 {
+                forced_first.unwrap_or(argmax)
+            } else {
+                argmax
+            };
             if best == end_of_turn {
                 break;
             }
