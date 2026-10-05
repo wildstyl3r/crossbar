@@ -446,6 +446,12 @@ pub struct FeedbackConfig {
     pub decay: f64,
     /// Consecutive-input cosine above which Heuristic decays the temperature.
     pub max_cosine: f64,
+    /// Weight of the expected embedding in the decode input
+    /// (1 - a) * E[sampled] + a * expected; 1.0 is the pure expected input.
+    pub blend: f64,
+    /// Weight of the per-position expected embedding in the prefill input;
+    /// 0 disables prefill feedback.
+    pub prefill_blend: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -455,10 +461,20 @@ pub struct FeedbackStats {
     pub entropy: f64,
     /// Effective support exp(entropy).
     pub support: f64,
-    /// L2 norm of the fed-back expected embedding.
+    /// L2 norm of the fed-back input (the blended input when blend < 1).
     pub input_norm: f64,
     /// Cosine between consecutive fed-back inputs; NaN on the first step.
     pub cosine_prev: f64,
+}
+
+/// Summary over all prefill positions of the prompt-feedback observation
+/// pass.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillStats {
+    /// Mean of the per-chunk temperatures used.
+    pub temperature: f64,
+    /// Mean per-position entropy of the feedback distributions, nats.
+    pub entropy: f64,
 }
 
 /// Entropy of softmax(logits / T) in nats.
@@ -639,9 +655,10 @@ impl Model {
     pub fn forward_feedback(
         &mut self,
         logits: &Tensor,
+        sampled_token: u32,
         seqlen_offset: usize,
     ) -> Result<(Tensor, FeedbackStats)> {
-        let (xs, stats) = self.feedback_input(logits)?;
+        let (xs, stats) = self.feedback_input(logits, sampled_token)?;
         let (b_size, seq_len, _) = xs.dims3()?;
 
         let (attention_mask, sliding_attention_mask) =
@@ -651,29 +668,58 @@ impl Model {
         Ok((self.finish(xs)?, stats))
     }
 
-    fn feedback_input(&mut self, logits: &Tensor) -> Result<(Tensor, FeedbackStats)> {
+    fn resolve_temperature(&self, logits_f32: &Tensor, n_positions: usize) -> Result<f64> {
+        match self.feedback.mode {
+            FeedbackTempMode::Fixed => Ok(self.feedback.temperature),
+            FeedbackTempMode::EntropyServo => solve_entropy_temperature(
+                logits_f32,
+                self.feedback.target_entropy * n_positions as f64,
+            ),
+            FeedbackTempMode::OneSidedServo => solve_entropy_temperature(
+                logits_f32,
+                self.feedback.target_entropy * n_positions as f64,
+            )
+            .map(|t| t.min(1.0)),
+            FeedbackTempMode::Heuristic => Ok(self.heuristic_t),
+        }
+    }
+
+    /// Expected embedding from raw logits at the given temperature, as
+    /// softmax(logits / T) @ E * sqrt(hidden_size).
+    fn expected_from_logits(&self, logits_f32: &Tensor, temperature: f64) -> Result<Tensor> {
+        let probs = candle_nn::ops::softmax_last_dim(&(logits_f32 / temperature)?)?;
+        let (b_sz, seq_len, vocab) = probs.dims3()?;
+        let embeddings = self.embed_tokens.embeddings();
+        let xs = probs
+            .reshape((b_sz * seq_len, vocab))?
+            .to_dtype(embeddings.dtype())?
+            .matmul(embeddings)?;
+        xs.reshape((b_sz, seq_len, ()))?
+            .affine((self.hidden_size as f64).sqrt(), 0.0)?
+            .to_dtype(DType::F32)
+    }
+
+    fn feedback_input(&mut self, logits: &Tensor, sampled_token: u32) -> Result<(Tensor, FeedbackStats)> {
         let logits_f32 = logits.to_dtype(DType::F32)?;
-        let temperature = match self.feedback.mode {
-            FeedbackTempMode::Fixed => self.feedback.temperature,
-            FeedbackTempMode::EntropyServo => {
-                solve_entropy_temperature(&logits_f32, self.feedback.target_entropy)?
-            }
-            FeedbackTempMode::OneSidedServo => {
-                solve_entropy_temperature(&logits_f32, self.feedback.target_entropy)?.min(1.0)
-            }
-            FeedbackTempMode::Heuristic => self.heuristic_t,
-        };
+        let temperature = self.resolve_temperature(&logits_f32, 1)?;
+        let expected = self.expected_from_logits(&logits_f32, temperature)?;
         let probs = candle_nn::ops::softmax_last_dim(&(logits_f32 / temperature)?)?;
         let logp = (&probs + 1e-12)?.log()?;
         let entropy = -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64);
-        let (b_sz, seq_len, vocab) = probs.dims3()?;
-        let probs = probs.reshape((b_sz * seq_len, vocab))?;
-        let embeddings = self.embed_tokens.embeddings();
-        let xs = probs.to_dtype(embeddings.dtype())?.matmul(embeddings)?;
-        let xs = xs
-            .reshape((b_sz, seq_len, ()))?
-            .affine((self.hidden_size as f64).sqrt(), 0.0)?
-            .to_dtype(self.dtype)?;
+
+        let alpha = self.feedback.blend;
+        let xs = if alpha >= 1.0 {
+            expected
+        } else {
+            let token = Tensor::new(&[sampled_token], &self.device)?.unsqueeze(0)?;
+            let row = self
+                .embed_tokens
+                .forward(&token)?
+                .to_dtype(DType::F32)?
+                .affine((self.hidden_size as f64).sqrt(), 0.0)?;
+            (&row * (1.0 - alpha))?.broadcast_add(&(&expected * alpha)?)?
+        };
+        let xs = xs.to_dtype(self.dtype)?;
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let norm = xs_f32
             .sqr()?
@@ -715,10 +761,81 @@ impl Model {
         Ok((xs, stats))
     }
 
-    pub fn clear_kv_cache(&mut self) {
+    /// Prefill with prompt feedback: an observation pass builds per-position
+    /// expected embeddings from full-position logits, then one injection
+    /// pass over the blended embeddings builds the KV cache the decode loop
+    /// continues from. Returns last-position logits and summary stats.
+    pub fn forward_prompt_blend(
+        &mut self,
+        input_ids: &Tensor,
+    ) -> Result<(Tensor, PrefillStats)> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        const CHUNK: usize = 64;
+        let alpha = self.feedback.prefill_blend.clamp(0.0, 1.0);
+        let mut expected_chunks: Vec<Tensor> = Vec::new();
+        let mut t_sum = 0f64;
+        let mut h_sum = 0f64;
+        let mut n_positions = 0usize;
+        for start in (0..seq_len).step_by(CHUNK) {
+            let len = CHUNK.min(seq_len - start);
+            let ids = input_ids.narrow(1, start, len)?;
+            let xs = self
+                .embed_tokens
+                .forward(&ids)?
+                .affine((self.hidden_size as f64).sqrt(), 0.0)?;
+            let (attention_mask, sliding_attention_mask) =
+                self.create_attention_masks(b_size, len, start)?;
+            let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, start)?;
+            let logits_f32 = self.finish(xs)?.to_dtype(DType::F32)?;
+            let temperature = self.resolve_temperature(&logits_f32, len)?;
+            let probs = candle_nn::ops::softmax_last_dim(&(&logits_f32 / temperature)?)?;
+            let logp = (&probs + 1e-12)?.log()?;
+            let chunk_h = -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64)
+                / (b_size * len) as f64;
+            t_sum += temperature;
+            h_sum += chunk_h * len as f64;
+            n_positions += len;
+            expected_chunks.push(self.expected_from_logits(&logits_f32, temperature)?);
+        }
+        self.reset_layer_caches();
+
+        let mut chunks = Vec::with_capacity(expected_chunks.len());
+        for (ci, expected) in expected_chunks.into_iter().enumerate() {
+            let start = ci * CHUNK;
+            let len = CHUNK.min(seq_len - start);
+            let ids = input_ids.narrow(1, start, len)?;
+            let base = self
+                .embed_tokens
+                .forward(&ids)?
+                .affine((self.hidden_size as f64).sqrt(), 0.0)?
+                .to_dtype(DType::F32)?;
+            let blended = if alpha >= 1.0 {
+                expected
+            } else {
+                (&base * (1.0 - alpha))?.broadcast_add(&(&expected * alpha)?)?
+            };
+            chunks.push(blended.to_dtype(self.dtype)?);
+        }
+        let xs = Tensor::cat(&chunks, 1)?;
+        let (attention_mask, sliding_attention_mask) =
+            self.create_attention_masks(b_size, seq_len, 0)?;
+        let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, 0)?;
+        let stats = PrefillStats {
+            temperature: if n_positions > 0 { t_sum / (seq_len as f64 / CHUNK as f64).ceil() } else { f64::NAN },
+            entropy: if n_positions > 0 { h_sum / n_positions as f64 } else { f64::NAN },
+        };
+        let logits = self.finish(xs.narrow(1, seq_len - 1, 1)?)?;
+        Ok((logits, stats))
+    }
+
+    fn reset_layer_caches(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.reset_layer_caches();
         self.heuristic_t = self.feedback.temperature;
         self.last_input = None;
     }

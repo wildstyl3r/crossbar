@@ -78,6 +78,27 @@ impl TokenOutputStream {
     }
 }
 
+pub struct GenerationOutcome {
+    /// Full generated text (special tokens skipped).
+    pub text: String,
+    /// Number of generated tokens (including a trailing EOS).
+    pub tokens: usize,
+    /// Mean feedback-distribution entropy over the steps that used feedback.
+    pub mean_hfb: Option<f64>,
+    /// Mean raw-distribution entropy (T=1) over all steps.
+    pub mean_raw_h: Option<f64>,
+}
+
+pub(crate) struct GenerationTiming {
+    pub prompt_len: usize,
+    pub prefill: std::time::Duration,
+    pub decode_tokens: usize,
+    pub decode_forward: std::time::Duration,
+    pub decode_sample: std::time::Duration,
+    pub decode_total: std::time::Duration,
+    pub total: std::time::Duration,
+}
+
 pub struct TextGeneration {
     model: Engine,
     device: Device,
@@ -88,7 +109,9 @@ pub struct TextGeneration {
     eos_tokens: Vec<u32>,
     debug_logits: bool,
     softmax_feedback: bool,
+    prefill_feedback: bool,
     diagnostics: bool,
+    collect_stats: bool,
 }
 
 impl TextGeneration {
@@ -106,6 +129,7 @@ impl TextGeneration {
         device: &Device,
         debug_logits: bool,
         softmax_feedback: bool,
+        prefill_feedback: bool,
         diagnostics: bool,
     ) -> Self {
         let logits_processor = LogitsProcessor::new(seed, temperature, top_k, top_p);
@@ -119,11 +143,26 @@ impl TextGeneration {
             device: device.clone(),
             debug_logits,
             softmax_feedback,
+            prefill_feedback,
             diagnostics,
+            collect_stats: false,
         }
     }
 
-    pub fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
+    /// Collect per-example mean entropies (used by the benchmark); does not
+    /// enable the stderr diagnostics rows.
+    pub fn set_collect_stats(&mut self, on: bool) {
+        self.collect_stats = on;
+    }
+
+    /// Generation core. With `stream` the tokens are printed as they are
+    /// produced; otherwise the run is silent and the text is returned.
+    pub(crate) fn generate(
+        &mut self,
+        prompt: &str,
+        sample_len: usize,
+        stream: bool,
+    ) -> Result<(GenerationOutcome, GenerationTiming)> {
         self.tokenizer.clear();
         self.model.clear_kv_cache();
         let mut tokens = self
@@ -142,25 +181,42 @@ impl TextGeneration {
         let mut decode_sample = std::time::Duration::ZERO;
         let mut decode_total = std::time::Duration::ZERO;
         let start_gen = std::time::Instant::now();
-        let mut prev_logits: Option<Tensor> = None;
+        let mut prev_fb: Option<(Tensor, u32)> = None;
+        let mut hfb_sum = 0f64;
+        let mut hfb_n = 0usize;
+        let mut raw_sum = 0f64;
+        let mut raw_n = 0usize;
         for index in 0..sample_len {
             let step_start = std::time::Instant::now();
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
             let t = std::time::Instant::now();
-            let (logits, fb_stats): (Tensor, Option<FeedbackStats>) = match prev_logits.take() {
-                Some(prev) => {
-                    let (l, s) = self.model.forward_feedback(&prev, start_pos)?;
+            let (logits, fb_stats): (Tensor, Option<FeedbackStats>) = match prev_fb.take() {
+                Some((prev_logits, prev_token)) => {
+                    let (l, s) = self
+                        .model
+                        .forward_feedback(&prev_logits, prev_token, start_pos)?;
                     (l, Some(s))
                 }
                 None => {
                     let ctxt = &tokens[start_pos..];
                     let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    (self.model.forward(&input, start_pos)?, None)
+                    if index == 0 && self.prefill_feedback {
+                        let (l, ps) = self.model.forward_prompt_blend(&input)?;
+                        if self.diagnostics {
+                            eprintln!(
+                                "# prefill-blend: T={:.4}, mean_H={:.4}",
+                                ps.temperature, ps.entropy
+                            );
+                        }
+                        (l, None)
+                    } else {
+                        (self.model.forward(&input, start_pos)?, None)
+                    }
                 }
             };
             let forward = t.elapsed();
-            prev_logits = if self.softmax_feedback {
+            let mut fb_logits = if self.softmax_feedback {
                 Some(logits.clone())
             } else {
                 None
@@ -183,7 +239,8 @@ impl TextGeneration {
                 }
             }
 
-            let diag_raw = if self.diagnostics {
+            let want_stats = self.diagnostics || self.collect_stats;
+            let diag_raw = if want_stats {
                 let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let exps: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
                 let sum: f32 = exps.iter().sum();
@@ -204,6 +261,7 @@ impl TextGeneration {
             }
 
             let next_token = self.logits_processor.sample(&mut logits);
+            prev_fb = fb_logits.take().map(|l| (l, next_token));
             let sampling = t.elapsed();
             if index == 0 {
                 prefill_total = step_start.elapsed();
@@ -215,6 +273,14 @@ impl TextGeneration {
             }
             tokens.push(next_token);
             generated_tokens += 1;
+            if let Some(s) = &fb_stats {
+                hfb_sum += s.entropy;
+                hfb_n += 1;
+            }
+            if let Some((_, _, raw_h)) = &diag_raw {
+                raw_sum += *raw_h;
+                raw_n += 1;
+            }
             if self.diagnostics {
                 if index == 0 {
                     eprintln!("# step,T,H_fb,support,norm_x,cos_prev,raw_H,surprisal,distinct2");
@@ -246,36 +312,68 @@ impl TextGeneration {
             if self.eos_tokens.contains(&next_token) {
                 break;
             }
-            if let Some(t) = self.tokenizer.next_token(next_token)? {
+            if stream
+                && let Some(t) = self.tokenizer.next_token(next_token)?
+            {
                 print!("{t}");
                 std::io::stdout().flush()?;
             }
         }
-        let dt = start_gen.elapsed();
+        let text = self
+            .tokenizer
+            .tokenizer()
+            .decode(&tokens[prompt_len..], true)
+            .map_err(E::msg)
+            .unwrap_or_default();
+        let outcome = GenerationOutcome {
+            text,
+            tokens: generated_tokens,
+            mean_hfb: (hfb_n > 0).then_some(hfb_sum / hfb_n as f64),
+            mean_raw_h: (raw_n > 0).then_some(raw_sum / raw_n as f64),
+        };
+        let timing = GenerationTiming {
+            prompt_len,
+            prefill: prefill_total,
+            decode_tokens,
+            decode_forward,
+            decode_sample,
+            decode_total,
+            total: start_gen.elapsed(),
+        };
+        Ok((outcome, timing))
+    }
+
+    pub fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
+        let (outcome, timing) = self.generate(prompt, sample_len, true)?;
         if let Some(rest) = self.tokenizer.decode_rest()? {
             print!("{rest}");
         }
         std::io::stdout().flush()?;
         println!(
-            "\n{generated_tokens} tokens generated ({:.2} token/s)",
-            generated_tokens as f64 / dt.as_secs_f64(),
+            "\n{} tokens generated ({:.2} token/s)",
+            outcome.tokens,
+            outcome.tokens as f64 / timing.total.as_secs_f64(),
         );
         println!(
-            "prefill: {prompt_len} tokens in {:.1} ms ({:.2} ms/token)",
-            prefill_total.as_secs_f64() * 1000.0,
-            prefill_total.as_secs_f64() * 1000.0 / prompt_len.max(1) as f64,
+            "prefill: {} tokens in {:.1} ms ({:.2} ms/token)",
+            timing.prompt_len,
+            timing.prefill.as_secs_f64() * 1000.0,
+            timing.prefill.as_secs_f64() * 1000.0 / timing.prompt_len.max(1) as f64,
         );
-        if decode_tokens > 0 {
-            let decode_ms = decode_total.as_secs_f64() * 1000.0;
-            let forward_ms = decode_forward.as_secs_f64() * 1000.0;
-            let sample_ms = decode_sample.as_secs_f64() * 1000.0;
-            let output_ms = (decode_total - decode_forward - decode_sample).as_secs_f64() * 1000.0;
+        if timing.decode_tokens > 0 {
+            let decode_ms = timing.decode_total.as_secs_f64() * 1000.0;
+            let forward_ms = timing.decode_forward.as_secs_f64() * 1000.0;
+            let sample_ms = timing.decode_sample.as_secs_f64() * 1000.0;
+            let output_ms =
+                (timing.decode_total - timing.decode_forward - timing.decode_sample).as_secs_f64()
+                    * 1000.0;
             let pct = |ms: f64| 100.0 * ms / decode_ms.max(f64::MIN_POSITIVE);
             println!(
-                "decode: {decode_tokens} tokens, avg {:.2} ms/token ({:.2} token/s) | \
+                "decode: {} tokens, avg {:.2} ms/token ({:.2} token/s) | \
                  model {:.2} ms ({:.1}%), sampling {:.2} ms ({:.1}%), output {:.2} ms ({:.1}%)",
-                decode_ms / decode_tokens as f64,
-                decode_tokens as f64 / decode_total.as_secs_f64(),
+                timing.decode_tokens,
+                decode_ms / timing.decode_tokens as f64,
+                timing.decode_tokens as f64 / timing.decode_total.as_secs_f64(),
                 forward_ms,
                 pct(forward_ms),
                 sample_ms,

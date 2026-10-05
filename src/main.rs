@@ -1,3 +1,4 @@
+mod bench;
 mod chat;
 mod generation;
 mod model;
@@ -17,9 +18,24 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
-    /// The prompt to run the generator with.
+    /// The prompt to run the generator with (required unless --bench or
+    /// --probe is set).
     #[arg(long, short = 'p')]
-    prompt: String,
+    prompt: Option<String>,
+
+    /// Run the feedback-impact benchmark suite instead of generating from a
+    /// prompt: greedy decoding over synthetic tasks (digit copy, arithmetic,
+    /// counting, induction, trivia) across baseline and feedback modes.
+    #[arg(long)]
+    bench: bool,
+
+    /// Number of examples per task for --bench (trivia caps at 40).
+    #[arg(long, default_value_t = 100)]
+    bench_n: usize,
+
+    /// Output CSV path for --bench with per-example rows.
+    #[arg(long, default_value = "bench_results.csv")]
+    bench_out: String,
 
     /// Optional system prompt, folded into the first user turn.
     #[arg(long)]
@@ -82,6 +98,16 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     softmax_feedback_temperature: f64,
 
+    /// Weight of the expected embedding in the decode input
+    /// (1 - a) * E[sampled] + a * expected; 1.0 is the pure expected input.
+    #[arg(long, default_value_t = 1.0)]
+    softmax_feedback_blend: f64,
+
+    /// Weight of the per-position expected embedding in the prefill input
+    /// (prompt feedback, two-pass); 0 disables it.
+    #[arg(long, default_value_t = 0.0)]
+    prefill_feedback_blend: f64,
+
     /// How the feedback temperature is chosen each step: the fixed value,
     /// an entropy-matched servo, or a threshold-based heuristic.
     #[arg(long, value_enum, default_value = "fixed")]
@@ -132,11 +158,22 @@ impl Engine {
     fn forward_feedback(
         &mut self,
         logits: &candle::Tensor,
+        sampled_token: u32,
         pos: usize,
     ) -> candle::Result<(candle::Tensor, model::FeedbackStats)> {
         match self {
-            Self::F32(m) => m.forward_feedback(logits, pos),
-            Self::Quantized(m) => m.forward_feedback(logits, pos),
+            Self::F32(m) => m.forward_feedback(logits, sampled_token, pos),
+            Self::Quantized(m) => m.forward_feedback(logits, sampled_token, pos),
+        }
+    }
+
+    fn forward_prompt_blend(
+        &mut self,
+        input_ids: &candle::Tensor,
+    ) -> candle::Result<(candle::Tensor, model::PrefillStats)> {
+        match self {
+            Self::F32(m) => m.forward_prompt_blend(input_ids),
+            Self::Quantized(m) => m.forward_prompt_blend(input_ids),
         }
     }
 
@@ -251,6 +288,31 @@ fn main() -> Result<()> {
     } else {
         Device::cuda_if_available(0)?
     };
+    println!("backend: {}", if gguf_file.is_some() { "gguf (quantized)" } else { "safetensors" });
+    let make_engine = |feedback: model::FeedbackConfig| -> Result<Engine> {
+        if let Some(ref gguf_path) = gguf_file {
+            let mut reader = std::fs::File::open(gguf_path)?;
+            Ok(Engine::Quantized(quantized_model::QuantizedModel::from_gguf(
+                &mut reader,
+                &device,
+                feedback,
+            )?))
+        } else {
+            let config: model::Config = serde_json::from_reader(std::fs::File::open(resolve_file(
+                model_dir,
+                fallback_dir,
+                "config.json",
+            )?)?)?;
+            let dtype = if device.is_cuda() {
+                DType::BF16
+            } else {
+                DType::F32
+            };
+            let weight_files = find_weight_files(model_dir)?;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
+            Ok(Engine::F32(model::Model::new(&config, vb, feedback)?))
+        }
+    };
     let feedback = model::FeedbackConfig {
         mode: args.softmax_feedback_mode,
         temperature: args.softmax_feedback_temperature,
@@ -258,36 +320,14 @@ fn main() -> Result<()> {
         band: args.softmax_feedback_band,
         decay: args.softmax_feedback_decay,
         max_cosine: args.softmax_feedback_max_cosine,
+        blend: args.softmax_feedback_blend,
+        prefill_blend: args.prefill_feedback_blend,
     };
-    let mut engine = if let Some(ref gguf_path) = gguf_file {
-        println!("backend: gguf (quantized) - {}", gguf_path.display());
-        let mut reader = std::fs::File::open(gguf_path)?;
-        Engine::Quantized(quantized_model::QuantizedModel::from_gguf(
-            &mut reader,
-            &device,
-            feedback,
-        )?)
-    } else {
-        println!("backend: safetensors");
-        let config: model::Config = serde_json::from_reader(std::fs::File::open(resolve_file(
-            model_dir,
-            fallback_dir,
-            "config.json",
-        )?)?)?;
-        let dtype = if device.is_cuda() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
-        let weight_files = find_weight_files(model_dir)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
-        Engine::F32(model::Model::new(&config, vb, feedback)?)
-    };
+    let mut engine = make_engine(feedback)?;
     println!("loaded the model in {:?}", start.elapsed());
 
     let chat_template =
         std::fs::read_to_string(resolve_file(model_dir, fallback_dir, "chat_template.jinja")?)?;
-    let prompt = chat::render(&chat_template, args.system.as_deref(), &args.prompt)?;
 
     if args.probe {
         let token = tokenizer.token_to_id("Paris").context("no Paris token")?;
@@ -302,6 +342,33 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+
+    let mut eos_tokens = generation_config.eos_ids();
+    for special in ["<eos>", "<end_of_turn>"] {
+        if let Some(t) = tokenizer.token_to_id(special)
+            && !eos_tokens.contains(&t) {
+                eos_tokens.push(t);
+            }
+    }
+
+    if args.bench {
+        bench::run_bench(
+            &make_engine,
+            tokenizer,
+            &chat_template,
+            eos_tokens,
+            &device,
+            args.bench_n,
+            &args.bench_out,
+        )?;
+        return Ok(());
+    }
+
+    let prompt = args
+        .prompt
+        .as_deref()
+        .context("--prompt is required unless --probe or --bench is set")?;
+    let prompt = chat::render(&chat_template, args.system.as_deref(), prompt)?;
 
     let do_sample = generation_config.do_sample.unwrap_or(true);
     let temperature = if do_sample {
@@ -321,10 +388,11 @@ fn main() -> Result<()> {
     );
     if args.softmax_feedback {
         println!(
-            "softmax feedback: on, mode: {:?}, temperature: {:.3}, target entropy: {:.2}",
+            "softmax feedback: on, mode: {:?}, temperature: {:.3}, target entropy: {:.2}, blend: {:.2}",
             args.softmax_feedback_mode,
             args.softmax_feedback_temperature,
-            args.softmax_feedback_target_entropy
+            args.softmax_feedback_target_entropy,
+            args.softmax_feedback_blend
         );
         if args.softmax_feedback_mode == model::FeedbackTempMode::Heuristic {
             println!(
@@ -338,13 +406,11 @@ fn main() -> Result<()> {
             println!("  diagnostics: per-step CSV on stderr");
         }
     }
-
-    let mut eos_tokens = generation_config.eos_ids();
-    for special in ["<eos>", "<end_of_turn>"] {
-        if let Some(t) = tokenizer.token_to_id(special)
-            && !eos_tokens.contains(&t) {
-                eos_tokens.push(t);
-            }
+    if args.prefill_feedback_blend > 0.0 {
+        println!(
+            "prefill feedback: on, blend: {:.2}",
+            args.prefill_feedback_blend
+        );
     }
 
     let mut pipeline = generation::TextGeneration::new(
@@ -360,6 +426,7 @@ fn main() -> Result<()> {
         &device,
         args.debug_logits,
         args.softmax_feedback,
+        args.prefill_feedback_blend > 0.0,
         args.softmax_feedback_diagnostics,
     );
     pipeline.run(&prompt, args.sample_len)?;
