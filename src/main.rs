@@ -69,6 +69,18 @@ struct Args {
     /// Dump embedding row and single-token logits for a token (debug).
     #[arg(long)]
     probe: bool,
+
+    /// Feed the previous step's expected token embedding softmax(logits / T)
+    /// @ E back into the first block during decoding, instead of embedding
+    /// the sampled token; textual decoding stays normal.
+    #[arg(long)]
+    softmax_feedback: bool,
+
+    /// Softmax temperature for --softmax-feedback; 0 approaches the argmax
+    /// token's embedding (i.e. normal generation), large values approach the
+    /// mean embedding.
+    #[arg(long, default_value_t = 1.0)]
+    softmax_feedback_temperature: f64,
 }
 
 enum Engine {
@@ -77,10 +89,25 @@ enum Engine {
 }
 
 impl Engine {
-    fn forward(&mut self, input_ids: &candle::Tensor, pos: usize) -> candle::Result<candle::Tensor> {
+    fn forward(
+        &mut self,
+        input_ids: &candle::Tensor,
+        pos: usize,
+    ) -> candle::Result<candle::Tensor> {
         match self {
             Self::F32(m) => m.forward(input_ids, pos),
             Self::Quantized(m) => m.forward(input_ids, pos),
+        }
+    }
+
+    fn forward_feedback(
+        &mut self,
+        logits: &candle::Tensor,
+        pos: usize,
+    ) -> candle::Result<candle::Tensor> {
+        match self {
+            Self::F32(m) => m.forward_feedback(logits, pos),
+            Self::Quantized(m) => m.forward_feedback(logits, pos),
         }
     }
 
@@ -195,10 +222,17 @@ fn main() -> Result<()> {
     } else {
         Device::cuda_if_available(0)?
     };
+    let feedback = model::FeedbackConfig {
+        temperature: args.softmax_feedback_temperature,
+    };
     let mut engine = if let Some(ref gguf_path) = gguf_file {
         println!("backend: gguf (quantized) - {}", gguf_path.display());
         let mut reader = std::fs::File::open(gguf_path)?;
-        Engine::Quantized(quantized_model::QuantizedModel::from_gguf(&mut reader, &device)?)
+        Engine::Quantized(quantized_model::QuantizedModel::from_gguf(
+            &mut reader,
+            &device,
+            feedback,
+        )?)
     } else {
         println!("backend: safetensors");
         let config: model::Config = serde_json::from_reader(std::fs::File::open(resolve_file(
@@ -213,7 +247,7 @@ fn main() -> Result<()> {
         };
         let weight_files = find_weight_files(model_dir)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
-        Engine::F32(model::Model::new(&config, vb)?)
+        Engine::F32(model::Model::new(&config, vb, feedback)?)
     };
     println!("loaded the model in {:?}", start.elapsed());
 
@@ -249,8 +283,14 @@ fn main() -> Result<()> {
         top_k.map(|k| k.to_string()).unwrap_or_else(|| "-".into()),
         top_p.map(|p| format!("{p:.2}")).unwrap_or_else(|| "-".into()),
         args.repeat_penalty,
-        args.repeat_last_n
+        args.repeat_last_n,
     );
+    if args.softmax_feedback {
+        println!(
+            "softmax feedback: on, temperature: {:.3}",
+            args.softmax_feedback_temperature
+        );
+    }
 
     let mut eos_tokens = generation_config.eos_ids();
     for special in ["<eos>", "<end_of_turn>"] {
@@ -272,6 +312,7 @@ fn main() -> Result<()> {
         eos_tokens,
         &device,
         args.debug_logits,
+        args.softmax_feedback,
     );
     pipeline.run(&prompt, args.sample_len)?;
     Ok(())

@@ -6,8 +6,8 @@ use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::{kv_cache::KvCache, kv_cache::RotatingKvCache, Activation, Embedding};
 
 use crate::model::{
-    prepare_decoder_attention_mask, repeat_kv, Config, KvCacheKind, ProbeOut, RmsNorm,
-    RotaryEmbedding,
+    prepare_decoder_attention_mask, repeat_kv, Config, FeedbackConfig, KvCacheKind, ProbeOut,
+    RmsNorm, RotaryEmbedding,
 };
 
 struct QMatMul {
@@ -217,10 +217,18 @@ pub struct QuantizedModel {
     dtype: DType,
     hidden_size: usize,
     sliding_window: usize,
+    feedback: FeedbackConfig,
+    /// F32 copy of the embedding table, built lazily for the softmax
+    /// feedback (the stored table is BF16).
+    embeddings_f32: Option<Tensor>,
 }
 
 impl QuantizedModel {
-    pub fn from_gguf<R: Read + Seek>(reader: &mut R, device: &Device) -> Result<Self> {
+    pub fn from_gguf<R: Read + Seek>(
+        reader: &mut R,
+        device: &Device,
+        feedback: FeedbackConfig,
+    ) -> Result<Self> {
         let ct = gguf_file::Content::read(reader)?;
         let token_embd = ct.tensor(reader, "token_embd.weight", device)?;
         let dims = token_embd.shape().dims();
@@ -350,6 +358,8 @@ impl QuantizedModel {
             dtype: DType::F32,
             hidden_size: cfg.hidden_size,
             sliding_window: cfg.sliding_window,
+            feedback,
+            embeddings_f32: None,
         })
     }
 
@@ -384,32 +394,76 @@ impl QuantizedModel {
         Ok((Some(mask), Some(sliding_mask)))
     }
 
-    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let (b_size, seq_len) = input_ids.dims2()?;
-        let xs = self.embed_tokens.forward(input_ids)?;
-        let mut xs = (xs.to_dtype(DType::F32)? * (self.hidden_size as f64).sqrt())?;
-
-        let (attention_mask, sliding_attention_mask) =
-            self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
-
+    fn run_layers(
+        &mut self,
+        mut xs: Tensor,
+        attention_mask: &Option<Tensor>,
+        sliding_attention_mask: &Option<Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
         for layer in self.layers.iter_mut() {
             let mask = if layer.sliding_window.is_some() {
-                &sliding_attention_mask
+                sliding_attention_mask
             } else {
-                &attention_mask
+                attention_mask
             };
             xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?
         }
-        let logits = xs
-            .narrow(1, seq_len - 1, 1)?
-            .apply(&self.norm)?
-            .apply(&self.lm_head)?;
+        Ok(xs)
+    }
+
+    fn finish(&self, last: Tensor) -> Result<Tensor> {
+        let logits = last.apply(&self.norm)?.apply(&self.lm_head)?;
         let logits = match self.final_logit_softcapping {
             None => logits,
             Some(sc) => ((logits / sc)?.tanh()? * sc)?,
         };
-
         Ok(logits)
+    }
+
+    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        let xs = self.embed_tokens.forward(input_ids)?;
+        let xs = (xs.to_dtype(DType::F32)? * (self.hidden_size as f64).sqrt())?;
+
+        let (attention_mask, sliding_attention_mask) =
+            self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
+
+        let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
+        self.finish(xs.narrow(1, seq_len - 1, 1)?)
+    }
+
+    /// Feed the previous step's expected token embedding back into the first
+    /// block, skipping the embedding lookup of the sampled token.
+    pub fn forward_feedback(
+        &mut self,
+        logits: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let xs = self.expected_embedding(logits)?;
+        let (b_size, seq_len, _) = xs.dims3()?;
+
+        let (attention_mask, sliding_attention_mask) =
+            self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
+
+        let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
+        self.finish(xs)
+    }
+
+    fn expected_embedding(&mut self, logits: &Tensor) -> Result<Tensor> {
+        let temperature = self.feedback.temperature.max(1e-6);
+        let logits = (logits.to_dtype(DType::F32)? / temperature)?;
+        let (b_sz, seq_len, vocab) = logits.dims3()?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?.reshape((b_sz * seq_len, vocab))?;
+        if self.embeddings_f32.is_none() {
+            self.embeddings_f32 = Some(self.embed_tokens.embeddings().to_dtype(DType::F32)?);
+        }
+        let embeddings = self.embeddings_f32.as_ref().unwrap();
+        let xs = probs.matmul(embeddings)?;
+        let xs = xs
+            .reshape((b_sz, seq_len, ()))?
+            .affine((self.hidden_size as f64).sqrt(), 0.0)?;
+        xs.to_dtype(self.dtype)
     }
 
     pub fn clear_kv_cache(&mut self) {

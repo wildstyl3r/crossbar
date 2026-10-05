@@ -85,6 +85,7 @@ pub struct TextGeneration {
     repeat_last_n: usize,
     eos_tokens: Vec<u32>,
     debug_logits: bool,
+    softmax_feedback: bool,
 }
 
 impl TextGeneration {
@@ -101,6 +102,7 @@ impl TextGeneration {
         eos_tokens: Vec<u32>,
         device: &Device,
         debug_logits: bool,
+        softmax_feedback: bool,
     ) -> Self {
         let logits_processor = LogitsProcessor::new(seed, temperature, top_k, top_p);
         Self {
@@ -112,6 +114,7 @@ impl TextGeneration {
             eos_tokens,
             device: device.clone(),
             debug_logits,
+            softmax_feedback,
         }
     }
 
@@ -134,15 +137,26 @@ impl TextGeneration {
         let mut decode_sample = std::time::Duration::ZERO;
         let mut decode_total = std::time::Duration::ZERO;
         let start_gen = std::time::Instant::now();
+        let mut prev_logits: Option<Tensor> = None;
         for index in 0..sample_len {
             let step_start = std::time::Instant::now();
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
-            let ctxt = &tokens[start_pos..];
-            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let t = std::time::Instant::now();
-            let logits = self.model.forward(&input, start_pos)?;
+            let logits = match prev_logits.take() {
+                Some(prev) => self.model.forward_feedback(&prev, start_pos)?,
+                None => {
+                    let ctxt = &tokens[start_pos..];
+                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+                    self.model.forward(&input, start_pos)?
+                }
+            };
             let forward = t.elapsed();
+            prev_logits = if self.softmax_feedback {
+                Some(logits.clone())
+            } else {
+                None
+            };
 
             let t = std::time::Instant::now();
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
