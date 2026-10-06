@@ -226,6 +226,60 @@ What the runs taught us, in order of importance:
    ST-Gumbel phase exists precisely for this; its effectiveness is what
    run 4's final dual evaluation will show.
 
+## Runs 5-6 (2026-10-06): the M1 terminal verdict
+
+Short-schedule redo (75 warmup + 150 ST, justified by run 2's own trace),
+with the run-4 extras made configurable (`--train-gate-bias`,
+`--train-lr-warmup`, `--train-gate-floor`, `--train-gt-start/end`,
+`--train-seed`; run-2-faithful defaults). Also added: a gate-collapse
+detector (auto-abort after gate < 0.05 for 60 steps, forensic checkpoint),
+and the **first-token-guided free-running eval** (target's first token
+teacher-forced, then free-run) — which separates first-step bootstrap
+failures from decoding destabilization.
+
+- **Run 5a** (run-2-faithful: no ramp/floor/bias): warmup failed (loss
+  6-17 oscillating at baseline level, gate 0.3-0.5, never opened) —
+  killed manually. Note: step-0 loss identical across runs (17.2452) is
+  uninformative — zero-init W_o makes step 0 baseline regardless of the
+  module's (unseeded, thread_rng) weight draw; each process rolls fresh
+  module weights.
+- **Run 5b** (hybrid: lr ramp 50 + bias 0 + no floor): trained healthy
+  (warmup -> 3.2, ST 2.1 -> bump 5.9 -> **1.47**, gate 1.000 throughout).
+  Eval matrix: TF EM 27.6 -> 25.9 (flat), FR EM 33.0 -> **2.5** (loop
+  attractors), guided FR EM **88.0 -> 13.0** — the module actively
+  destabilizes decoding even with a correct first token. Same failure as
+  run 2, now reproduced from a clean training run with a kept checkpoint.
+- **Probe** (`--train-probe`, run-5b checkpoint): the Gumbel mixtures were
+  barely smeared (c_in 0.95-0.97 — no denoising opportunity); the module's
+  output is near-orthogonal to the clean embedding (c_st 0.21-0.22) and to
+  the input at deployment (c_dep 0.01-0.03); injection magnitude
+  **~131x the input norm**; ST inputs double-scaled by sqrt(h)
+  (`expected_from_probs` pre-scales, `enrich()` scales again; scale
+  measured 22-24 vs sqrt(640)=25.3); gate pinned at 1.0 (saturated by the
+  25x-scale inputs). **Diagnosis: the module learned to REPLACE the token
+  identity with W_o(pooled(states)) — the frozen model's own contextual
+  predictions — which is CE-optimal at training and precision-destroying
+  at deployment (the Finding-6 mechanism). Nothing in the objective
+  bounded the deviation.**
+- **Run 6a** (hard-forward ST + single-scaling + relative-L2 injection
+  penalty λ=0.1, no floor): the gate learned a new escape hatch — closing
+  it dodges the *applied* tax (penalty was on `gate * injected`) — and
+  collapsed at ST entry; auto-abort worked as designed.
+- **Run 6b** (+ gate floor 0.3 through both phases): trained through
+  (ST -> ~0.9-2.7), but equilibrated at the **identity** (gate rides the
+  annealed floor; applied injection ~0.1x). Eval: TF 27.6 = 27.6 (flat),
+  FR **31.5** (not destroyed), guided FR **87.0** (not destroyed). Probe:
+  c_dep 1.000, inj 0.000 — bit-exact identity at inference.
+
+**M1 sweep verdict**: at 131x and 0.1x injection, answer-slot enrichment
+from last-8 Pass-A states produced **zero** teacher-forced gain — the M1
+information source carries little extractable signal for these tasks.
+Two incentive lessons carried forward: (a) tax the **pre-gate** injection
+(the applied tax lets the gate dodge), (b) a magnitude penalty without a
+floor is escapable, a floor without a tax is a blindfold. M2
+(cascade-trained prompt-position enrichment — where the hand-set cascade
+already demonstrated +18) is the next design.
+
 ### Teacher-forcing check (run 4's terminal evaluation; what to look for)
 
 Run 4 ends with a dual evaluation on 200 held-out examples:
@@ -371,21 +425,19 @@ watching in the trained variant.
 
 1. ~~Bench round 2 + Finding 7 + commit.~~ (done, edaf828)
 2. ~~Enricher module + integration + gradient sanity.~~ (done; runs 1-4)
-3. ~~Run 4~~ terminal state: warmup healthy (loss 1.5-3.5, gate 0.5-0.6),
-   but the ST phase collapsed again (gate -> 0 by ST step ~20, loss ~15;
-   log ends mid-run at st 120). The saved checkpoint is post-collapse
-   (gate ~= 0 => approximately the identity map) — **no usable trained
-   enricher exists yet**; the ST-phase gate-collapse fix is the immediate
-   blocker for any overnight run (candidate fixes: gate floor during ST,
-   lower ST lr, guided-ST annealing before free-running).
-4. ~~Implement `--prefill-feedback-iters` (Schedule B inference) + run the
-   minimalist cascade experiment.~~ (done 2026-10-06; **cascade-helps
-   branch**: Finding 8, induce +18 p=0.006 at K=2/a_p=0.25).
-5. Cascade-trained ST overnight run (K=2, stop-grad recipe) — **after** the
-   ST gate-collapse fix; the trained gate should own the strength schedule
-   (the a_p>=0.5 / K=3 destruction shows fixed strength cannot be saved by
-   depth alone).
-6. Bench `enricher` mode (+ `enricher+cascade`) vs baseline/blend-d0.5
-   (transfer check: digits/trivia unharmed) → further findings in
-   FEEDBACK.md → commit.
-7. M3: REINFORCE/GRPO finetune; task family expansion.
+3. ~~Run 4~~ terminal state: warmup healthy, ST collapsed (gate -> 0 by
+   step ~20; loss ~15); checkpoint post-collapse (~= identity).
+4. ~~Minimalist cascade experiment (`--prefill-feedback-iters`)~~ (done
+   2026-10-06; **cascade-helps branch**: Finding 8, induce +18 p=0.006 at
+   K=2/a_p=0.25).
+5. ~~M1 short redo (runs 5-6)~~ (done 2026-10-06; **M1-negative verdict**:
+   the module either replaces the token identity (131x injection, deployed
+   decoding destroyed) or equilibrates at the identity; TF EM flat at both
+   operating points — see "Runs 5-6" above).
+6. **M2: cascade-trained prompt-position enrichment** — the module learns
+   the residual refinement on top of the hand-set cascade operator
+   (K=2, a_p=0.25 floor at 78% induce); inherits the hard-forward sampled
+   inputs, the pre-gate injection tax, floors, and the collapse detector.
+7. Bench the trained M2 module vs baseline / hand-set cascade
+   (transfer check: digits/trivia unharmed) -> FEEDBACK.md -> commit.
+8. M3: REINFORCE/GRPO finetune; task family expansion.
