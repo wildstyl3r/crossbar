@@ -147,17 +147,23 @@ Gradient paths from an answer-slot CE back to the module params:
 
 ## Gradient size estimates (batch 8 lockstep, T~80, F32 CPU)
 
-**Memory (graph).** ~10-11 MB of retained activations per in-graph step
-(18 layers x ~600 KB: q/k/v 4x256 per row, MLP gate/up/act 2048-wide, saved
-op inputs). tau=8 -> ~90 MB; tau=16 -> ~170 MB; full BPTT T=80 -> ~0.9 GB
-(and backward-prohibitive in time).
+**Memory (graph).** Original estimates (~10-11 MB/step, tau=8 ~ 90 MB)
+were ~50x optimistic: the measured backward peaks (tau-sweep table below)
+are dominated by (a) the frozen embedding-table and tied-head grad buffers
+(~2 GB, since removed from the graph via the detached lookup + surrogate
+head loss), (b) the in-graph KV cat/expand copies per layer-position
+(scaling ~tau x T x batch), (c) frozen-weight sum-grads (~0.45 GB) and
+candle's GradStore retaining all intermediate grads until the backward
+completes. Measured peaks: tau=4/6/8 exact = 3.8/5.3/6.8 GB (batch 8,
+T=64); the training loop's longest bucket scales ~1.4x. Per-process runs
+are the honest number — in-process sweeps ratchet the allocator
+high-water mark.
 
 **Time.** Forward is memory-bound (1.08 GB weight streaming per
-position-step, ~0.13-0.2 s for the whole batch-8 row). Per optimizer step:
-~80 cascade forward steps ~ 10-16 s + tau=8 backward ~ 2-4 s + ~5 lm_head
-finish calls ~ 0.3-0.6 s => **~15-20 s/step, ~1300-1900 steps/8 h night**.
-Warmup 150 + ST 300 ~ 2-3 h. (The M1 two-pass was 6-10 s/step; the ~2x is
-the price of training the exact deployment recurrence.)
+position-step, ~0.13-0.2 s; nearly batch-independent). Measured: ~8-11 s
+cascade forward (T=64-90) + 1.3-5 s backward => ~12 s/micro-step at
+batch 4-8. Wall time per *effective* step = accum x that; see the recipes
+table in the TBPTT section. The default 150+300 micros ~ 1.6-1.9 h.
 
 **Magnitude.**
 
@@ -289,6 +295,50 @@ injection so closing the gate cannot dodge it. Healthy band 0.25-1x
 relative injection energy; also serves as the BPTT well-conditioning
 (bounds c). Monitor both pre-gate and applied (post-gate) ratios.
 
+## Run v2-1 (2026-10-07): first dynamics smoke — healthy on every axis
+
+Config: tau=4 exact, batch 4 x accum 1 (60 real optimizer steps), warmup 30
++ ST 30 micros, lr ramp 10, gate bias +2 / floor 0.5, inj_l2 0.1, seed 42,
+~9.5 min wall, fresh W=0 start.
+
+Trajectory (warmup -> ST):
+
+| metric | warmup 0 | warmup 10 | warmup 20 | st 0 | st 10 | st 20 |
+|---|---|---|---|---|---|---|
+| ce | 4.42 | 3.78 | 4.11 | 7.58 | 5.96 | 5.40 |
+| gate | 0.940 | 0.949 | 0.974 | 0.980 | 0.980 | 0.982 |
+| pregate | 0.000 | 0.008 | 0.056 | 0.116 | 0.163 | 0.213 |
+| applied p/ans | 0/0 | — | — | 0.132/0.281 | 0.169/0.271 | 0.215/0.349 |
+| \|g\| | 17.7 | 33.4 | 46.0 | 40.4 | 40.8 | 25.3 |
+
+Probe (held-out, fresh pass, after training): gate 0.987 | pregate 0.245 |
+applied 0.233/0.353 | ce 5.14.
+
+Readings:
+
+1. **Cold start ~4.4 nats, not M1's 17**: at W=0 the transition-paired CE is
+   the frozen model's natural answer uncertainty; the M1 echo objective had
+   inflated it. ST entry bump (7.6) is the on-policy sampled tokens — it
+   *declines* (-> 5.4) while scheduled forcing anneals 1 -> 0.33.
+2. **No gate collapse anywhere** (0.94 -> 0.98 flat): the run-2/run-4
+   collapse pattern did not reproduce with hard-sampled tokens + scheduled
+   forcing + open-start bias + floor. The auto-abort never fired.
+3. **No injection takeover**: pregate grows monotonically-slowly (0 ->
+   0.245 over 60 steps) inside the lower healthy band; M1's failure was
+   131x — here ~0.25x and the pre-gate tax is active.
+4. **Rising \|g\| during warmup (17.7 -> 46) is the designed cross-step
+   wakeup signature**: at W=0 only the immediate path exists; as W grows
+   the state-chain turns on and adds gradient mass. \|g\| then declines at
+   ST (25) as the loss stabilizes.
+5. **Prompt-side writes earn credit**: applied p/ans ~ 0.23/0.35 — writes
+   concentrate at answer slots (~1.5x) but prompt positions are far from
+   zero. This is the KV-path credit the M1 answer-only design could never
+   get.
+6. **tau=4 is too short for long-answer buckets**: the
+   `tau=4 < answer_len+1=5` warning fired on buckets with 4-token answers
+   (the first transition's immediate gradient falls outside the window).
+   tau=6 (the default) covers them exactly — tau=4 is speed-smoke only.
+
 ## Inference integration
 
 - With `--enricher <path>`: **prefill is replaced by the sequential forced
@@ -333,15 +383,40 @@ for a full night (micro-steps ~2.5-3k ~ 8-10 h). Unattended runs with
 3. ~~Gradient sanity + tau-sweep~~ (done 2026-10-07: table above; tau=6
    exact chosen; embedding/head removed from the graph; accumulation
    implemented; per-tensor norms labeled + foreign-grad check).
-4. Data calibration smoke (25/task): baseline EM into the 30-80% band
-   under the *new* transition-paired scoring (the old numbers were measured
-   under echo pairing; recalibrate).
-5. Short CE + ST runs (~30 min): loss curves, gate/inj stats, free-running
-   stability.
+4. ~~Data calibration smoke~~ (superseded by run v2-1: baseline CE ~4.4
+   nats, held-out 5.1; the old echo-pairing numbers are obsolete).
+5. ~~Short CE + ST run~~ (done: run v2-1 above — healthy dynamics, no
+   collapse, no takeover; injection at the lower band edge after 60 steps).
 6. Overnight full run (scale --train-steps-* to the night budget;
    checkpoints every ~5 min).
 7. Evaluation: bench `enricher` mode (cascade) vs baseline; held-out EM;
    findings into FEEDBACK.md; commit.
+
+### Next-run suggestions
+
+- **Recommended overnight** (tau=6 exact, batch 4 x accum 4, ~8 h, 600
+  effective steps):
+  ```sh
+  cargo run --release -- --cpu --train-enricher \
+      --model-dir models/gemma-3-270m-it \
+      --train-steps-warmup 600 --train-steps-st 1800 \
+      --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
+      --train-out enricher_v2.safetensors
+  ```
+  (lr ramp 50 default; gate-bias/floor/inj defaults already match.)
+- **Medium smoke first** (~40 min, optional): same but
+  `--train-steps-warmup 150 --train-steps-st 150 --train-accum 1` — verify
+  injection climbs through the 0.25-1x band and CE keeps declining before
+  committing the night.
+- **Night watch list**: gate < 0.05 (auto-abort + forensic dump fires),
+  pregate > 1 (takeover watch; lambda can be raised), applied p/ans
+  divergence, CE trend through the forcing anneal, RSS in `top` (expect
+  ~4-5 GB steady).
+- **accum 8/16** only if the loss curve looks noise-dominated (wall time
+  ~2x/4x per effective step).
+- **tau revisit**: if after the night the answer-slot injections dominate
+  and prompt-side stays near zero, the 5-8 KV window was the missing
+  credit — try batch 4 x accum 8 with `--train-tau 8` (~2x wall time).
 
 ### Success criteria
 
