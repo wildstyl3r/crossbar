@@ -463,24 +463,7 @@ impl QuantizedModel {
         seqlen_offset: usize,
     ) -> Result<(Tensor, FeedbackStats)> {
         if self.enricher.is_some() {
-            let window = self.enricher.as_ref().unwrap().window().to_vec();
-            let token = Tensor::new(&[sampled_token], &self.device)?.unsqueeze(0)?;
-            let e = self
-                .embed_tokens
-                .forward(&token)?
-                .to_dtype(DType::F32)?
-                .squeeze(0)?
-                .squeeze(0)?;
-            let input = self.enricher.as_ref().unwrap().enrich(&e, &window)?.0;
-            let input = input.unsqueeze(0)?.unsqueeze(0)?;
-            let (attention_mask, sliding_attention_mask) =
-                self.create_attention_masks(1, 1, seqlen_offset)?;
-            let xs = self.run_layers(input, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
-            let last = xs.narrow(1, 0, 1)?;
-            let out = self.finish(last.clone())?;
-            if let Some(enr) = &mut self.enricher {
-                enr.push_state(last.squeeze(1)?.squeeze(0)?.contiguous()?);
-            }
+            let out = self.cascade_step(sampled_token, seqlen_offset)?;
             let stats = FeedbackStats {
                 temperature: f64::NAN,
                 entropy: f64::NAN,
@@ -694,9 +677,45 @@ impl QuantizedModel {
     }
 
     /// Attach a trained enricher (inference); replaces the softmax-blend
-    /// decode feedback with the learned attention-pooling enrichment.
+    /// decode feedback with the learned state-readout enrichment.
     pub fn set_enricher(&mut self, enr: crate::enrich::Enricher) {
         self.enricher = Some(enr);
+    }
+
+    /// Whether the enricher is attached (decides the cascade inference path).
+    pub fn has_enricher(&self) -> bool {
+        self.enricher.is_some()
+    }
+
+    /// One step of the sequential cascade with the enricher attached:
+    /// enrich the forced/sampled token's embedding from the previous state,
+    /// forward a single position at `seqlen_offset`, push the new state,
+    /// return the logits.
+    pub fn cascade_step(&mut self, token: u32, seqlen_offset: usize) -> Result<Tensor> {
+        if self.enricher.is_none() {
+            candle::bail!("cascade_step requires an attached enricher");
+        }
+        let input = {
+            let enr = self.enricher.as_ref().unwrap();
+            let token_t = Tensor::new(&[token], &self.device)?.unsqueeze(0)?;
+            let e = self
+                .embed_tokens
+                .forward(&token_t)?
+                .to_dtype(DType::F32)?
+                .squeeze(0)?
+                .squeeze(0)?;
+            let (input, _) = enr.enrich_1d(&e, enr.prev_state())?;
+            input.to_dtype(self.dtype)?.unsqueeze(0)?.unsqueeze(0)?
+        };
+        let (attention_mask, sliding_attention_mask) =
+            self.create_attention_masks(1, 1, seqlen_offset)?;
+        let xs = self.run_layers(input, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
+        let last = xs.narrow(1, 0, 1)?;
+        let out = self.finish(last.clone())?;
+        if let Some(enr) = &mut self.enricher {
+            enr.push_state(last.squeeze(1)?.squeeze(0)?.contiguous()?);
+        }
+        Ok(out)
     }
 
     pub fn hidden_size(&self) -> usize {
@@ -708,7 +727,7 @@ impl QuantizedModel {
         self.heuristic_t = self.feedback.temperature;
         self.last_input = None;
         if let Some(enr) = &mut self.enricher {
-            enr.clear_states();
+            enr.clear_state();
         }
     }
 

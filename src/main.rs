@@ -8,9 +8,9 @@ mod sampling;
 mod train;
 
 use anyhow::{Context, Error as E, Result};
-use clap::Parser;
 use candle::{DType, Device};
 use candle_nn::VarBuilder;
+use clap::Parser;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
@@ -55,7 +55,7 @@ struct Args {
     system: Option<String>,
 
     /// Directory containing the model files; auto-detects GGUF (quantized) vs safetensors.
-    #[arg(long, default_value = "models/gemma-3-270m-it")]
+    #[arg(long, default_value = "models/gemma-3-270m-it-qat-GGUF")]
     model_dir: String,
 
     /// Directory to fall back to for tokenizer/chat template/generation config
@@ -158,8 +158,9 @@ struct Args {
     #[arg(long)]
     softmax_feedback_diagnostics: bool,
 
-    /// Load a trained attention-pooling enricher checkpoint; replaces the
-    /// softmax-blend decode feedback with the learned enrichment.
+    /// Load a trained gated state-readout enricher checkpoint; prefill
+    /// becomes the sequential forced-token cascade and every decode step is
+    /// enriched from the previous state (parallel prefill is never used).
     #[arg(long)]
     enricher: Option<String>,
 
@@ -167,11 +168,11 @@ struct Args {
     #[arg(long)]
     train_enricher: bool,
 
-    /// Teacher-forced CE steps before the straight-through phase.
+    /// Teacher-forced CE steps before the hard-sampled ST phase.
     #[arg(long, default_value_t = 150)]
     train_steps_warmup: usize,
 
-    /// Straight-through Gumbel free-running steps after warmup.
+    /// Hard-sampled ST steps after warmup (scheduled forcing 1 -> 0).
     #[arg(long, default_value_t = 300)]
     train_steps_st: usize,
 
@@ -179,23 +180,21 @@ struct Args {
     #[arg(long, default_value = "enricher.safetensors")]
     train_out: String,
 
-    /// Initial gate bias of a fresh enricher (0 => sigmoid 0.5, run-2
-    /// recipe; run 4 used +2.0).
-    #[arg(long, default_value_t = 0.0)]
+    /// Initial gate bias of a fresh enricher (+2.0 => sigmoid ~0.88: the
+    /// gate starts open and must learn to close).
+    #[arg(long, default_value_t = 2.0)]
     train_gate_bias: f64,
 
-    /// Linear lr ramp length (steps) at the start of warmup (0 = constant
-    /// lr, run-2 recipe; run 4 used 50).
-    #[arg(long, default_value_t = 0)]
+    /// Linear lr ramp length (steps) at the start of warmup (0 = constant).
+    #[arg(long, default_value_t = 50)]
     train_lr_warmup: usize,
 
-    /// Gate floor during warmup (0 = none, run-2 recipe; run 4 used 0.5).
-    /// The ST phase anneals a floor of 0.6 * this -> 0.
-    #[arg(long, default_value_t = 0.0)]
+    /// Gate floor during warmup. The ST phase anneals 0.6 * this -> 0.
+    #[arg(long, default_value_t = 0.5)]
     train_gate_floor: f64,
 
-    /// Starting Gumbel temperature of the ST phase (annealed linearly to
-    /// --train-gt-end; run-2 recipe 1.0, post-run-2 code 0.5).
+    /// Starting sampling temperature of the ST phase (annealed to
+    /// --train-gt-end).
     #[arg(long, default_value_t = 1.0)]
     train_gt_start: f64,
 
@@ -204,10 +203,48 @@ struct Args {
     #[arg(long, default_value_t = 0.1)]
     train_gt_end: f64,
 
-    /// Relative injection penalty weight: loss + lambda * mean(
-    /// ||g*W_o(pooled)||^2 / ||e*sqrt(h)||^2 ). 0 disables.
+    /// Relative pre-gate injection penalty weight: loss + lambda * mean(
+    /// ||W shat||^2 / ||q||^2 ). 0 disables.
     #[arg(long, default_value_t = 0.1)]
     train_inj_l2: f64,
+
+    /// BPTT truncation horizon (in-graph cascade steps at the sequence end).
+    /// Measured (ENRICHER.md): the state-chain dies by ~4 steps (c^4 <= 6e-3
+    /// at healthy injection); the exact-KV path is the dominant cross-step
+    /// credit at init. tau=6 is the knee of the gradient/memory curve:
+    /// 72% of tau=8's gradient at 78% of its memory (5.3 vs 6.8 GB peak).
+    #[arg(long, default_value_t = 6)]
+    train_tau: usize,
+
+    /// Keep the full KV-path gradient in the training graph (default, exact:
+    /// at W=0 the KV path is the ONLY cross-step credit; detaching it
+    /// captured just 32% of the gradient in the tau-sweep). Disabling it
+    /// detaches keys/values for a smaller graph at a large gradient cost.
+    #[arg(long, default_value_t = true)]
+    train_kv_grad: bool,
+
+    /// Lockstep batch size per micro-step (4 halves the in-graph memory vs
+    /// 8; the cascade forward is weight-streaming-bound, so batch 4 costs
+    /// nearly the same wall time as 8).
+    #[arg(long, default_value_t = 4)]
+    train_batch: usize,
+
+    /// Micro-steps accumulated per optimizer step: effective batch =
+    /// batch x accum. batch 4 x accum 4 (effective 16) is the default
+    /// overnight recipe: ~3.5-4 GB peak, ~50-55 s/step, warmup 150 + ST 300
+    /// ~ 7 h. accum 8 halves the step count budget; accum 16 only if noise
+    /// demonstrably dominates.
+    #[arg(long, default_value_t = 4)]
+    train_accum: usize,
+
+    /// Override the tau-sweep diagnostic grid ("tau:kv,tau:kv", e.g.
+    /// "8:1"); empty runs the default comparison grid.
+    #[arg(long, default_value = "")]
+    train_sweep: String,
+
+    /// Global-norm gradient clip over the enricher parameters.
+    #[arg(long, default_value_t = 1.0)]
+    train_grad_clip: f64,
 
     /// Seed for the training-data shuffle and the ST sampling rng.
     #[arg(long, default_value_t = 31337)]
@@ -276,12 +313,8 @@ impl Engine {
         }
     }
 
-    fn set_enricher(&mut self, path: &str, r: usize, k: usize) -> Result<()> {
-        let hidden = match self {
-            Self::F32(m) => m.hidden_size(),
-            Self::Quantized(m) => m.hidden_size(),
-        };
-        let enr = enrich::Enricher::load(path, hidden, r, k)?;
+    fn set_enricher(&mut self, path: &str) -> Result<()> {
+        let enr = enrich::Enricher::load(path)?;
         match self {
             Self::F32(m) => m.set_enricher(enr),
             Self::Quantized(m) => m.set_enricher(enr),
@@ -289,41 +322,42 @@ impl Engine {
         Ok(())
     }
 
-    fn forward_inputs_train(
-        &self,
-        xs: &candle::Tensor,
-        lens: &[usize],
-        answer_start: usize,
-        answer_len: usize,
-    ) -> candle::Result<(candle::Tensor, candle::Tensor)> {
+    fn has_enricher(&self) -> bool {
         match self {
-            Self::F32(m) => m.forward_inputs_train(xs, lens, answer_start, answer_len),
-            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
+            Self::F32(m) => m.has_enricher(),
+            Self::Quantized(m) => m.has_enricher(),
         }
     }
 
-    fn embed_scale(
+    /// One sequential-cascade step (enriched input from the previous state,
+    /// single-position forward). Used for the forced-token prefill and every
+    /// decode step while the enricher is attached.
+    fn cascade_step(&mut self, token: u32, pos: usize) -> candle::Result<candle::Tensor> {
+        match self {
+            Self::F32(m) => m.cascade_step(token, pos),
+            Self::Quantized(m) => m.cascade_step(token, pos),
+        }
+    }
+
+    /// Sequential cascade training forward (TBPTT); F32 backend only.
+    #[allow(clippy::too_many_arguments)]
+    fn cascade_train_forward(
         &self,
+        enr: &enrich::Enricher,
         input_ids: &candle::Tensor,
-        lens: &[usize],
-    ) -> candle::Result<candle::Tensor> {
+        targets: &candle::Tensor,
+        answer_start: usize,
+        tau: usize,
+        kv_grad: bool,
+        forced_prob: f64,
+        gt: f64,
+        rng: &mut rand::rngs::StdRng,
+    ) -> Result<model::CascadeTrainOut> {
         match self {
-            Self::F32(m) => m.embed_scale(input_ids, lens),
-            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
-        }
-    }
-
-    fn embed_one(&self, token: &candle::Tensor) -> candle::Result<candle::Tensor> {
-        match self {
-            Self::F32(m) => m.embed_one(token),
-            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
-        }
-    }
-
-    fn expected_from_probs(&self, probs: &candle::Tensor) -> candle::Result<candle::Tensor> {
-        match self {
-            Self::F32(m) => m.expected_from_probs(probs),
-            Self::Quantized(_) => candle::bail!("training requires the safetensors backend"),
+            Self::F32(m) => Ok(m.cascade_train_forward(
+                enr, input_ids, targets, answer_start, tau, kv_grad, forced_prob, gt, rng,
+            )?),
+            Self::Quantized(_) => anyhow::bail!("training requires the safetensors backend"),
         }
     }
 
@@ -395,7 +429,11 @@ fn find_gguf_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     files.into_iter().next()
 }
 
-fn resolve_file(model_dir: &std::path::Path, fallback_dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+fn resolve_file(
+    model_dir: &std::path::Path,
+    fallback_dir: &std::path::Path,
+    name: &str,
+) -> Result<std::path::PathBuf> {
     let primary = model_dir.join(name);
     if primary.exists() {
         return Ok(primary);
@@ -404,7 +442,11 @@ fn resolve_file(model_dir: &std::path::Path, fallback_dir: &std::path::Path, nam
     if fallback.exists() {
         return Ok(fallback);
     }
-    anyhow::bail!("neither {} nor {} found", primary.display(), fallback.display())
+    anyhow::bail!(
+        "neither {} nor {} found",
+        primary.display(),
+        fallback.display()
+    )
 }
 
 fn main() -> Result<()> {
@@ -439,21 +481,24 @@ fn main() -> Result<()> {
     } else {
         Device::cuda_if_available(0)?
     };
-    println!("backend: {}", if gguf_file.is_some() { "gguf (quantized)" } else { "safetensors" });
+    println!(
+        "backend: {}",
+        if gguf_file.is_some() {
+            "gguf (quantized)"
+        } else {
+            "safetensors"
+        }
+    );
     let make_engine = |feedback: model::FeedbackConfig| -> Result<Engine> {
         if let Some(ref gguf_path) = gguf_file {
             let mut reader = std::fs::File::open(gguf_path)?;
-            Ok(Engine::Quantized(quantized_model::QuantizedModel::from_gguf(
-                &mut reader,
-                &device,
-                feedback,
-            )?))
+            Ok(Engine::Quantized(
+                quantized_model::QuantizedModel::from_gguf(&mut reader, &device, feedback)?,
+            ))
         } else {
-            let config: model::Config = serde_json::from_reader(std::fs::File::open(resolve_file(
-                model_dir,
-                fallback_dir,
-                "config.json",
-            )?)?)?;
+            let config: model::Config = serde_json::from_reader(std::fs::File::open(
+                resolve_file(model_dir, fallback_dir, "config.json")?,
+            )?)?;
             let dtype = if device.is_cuda() {
                 DType::BF16
             } else {
@@ -477,13 +522,16 @@ fn main() -> Result<()> {
     };
     let mut engine = make_engine(feedback)?;
     if let Some(path) = &args.enricher {
-        engine.set_enricher(path, 192, 8)?;
-        println!("enricher: loaded from {path}");
+        engine.set_enricher(path)?;
+        println!("enricher: loaded from {path} (cascade prefill + decode)");
     }
     println!("loaded the model in {:?}", start.elapsed());
 
-    let chat_template =
-        std::fs::read_to_string(resolve_file(model_dir, fallback_dir, "chat_template.jinja")?)?;
+    let chat_template = std::fs::read_to_string(resolve_file(
+        model_dir,
+        fallback_dir,
+        "chat_template.jinja",
+    )?)?;
 
     if args.train_enricher {
         if args.train_probe {
@@ -511,6 +559,12 @@ fn main() -> Result<()> {
                 gt_start: args.train_gt_start,
                 gt_end: args.train_gt_end,
                 inj_l2: args.train_inj_l2,
+                tau: args.train_tau,
+                kv_grad: args.train_kv_grad,
+                batch: args.train_batch,
+                accum: args.train_accum,
+                sweep: args.train_sweep.clone(),
+                grad_clip: args.train_grad_clip,
                 seed: args.train_seed,
                 skip_eval: args.train_skip_eval,
             },
@@ -535,9 +589,10 @@ fn main() -> Result<()> {
     let mut eos_tokens = generation_config.eos_ids();
     for special in ["<eos>", "<end_of_turn>"] {
         if let Some(t) = tokenizer.token_to_id(special)
-            && !eos_tokens.contains(&t) {
-                eos_tokens.push(t);
-            }
+            && !eos_tokens.contains(&t)
+        {
+            eos_tokens.push(t);
+        }
     }
 
     if args.bench {
@@ -564,7 +619,11 @@ fn main() -> Result<()> {
 
     let do_sample = generation_config.do_sample.unwrap_or(true);
     let temperature = if do_sample {
-        Some(args.temperature.or(generation_config.temperature).unwrap_or(1.0))
+        Some(
+            args.temperature
+                .or(generation_config.temperature)
+                .unwrap_or(1.0),
+        )
     } else {
         Some(0.0)
     };
@@ -574,7 +633,9 @@ fn main() -> Result<()> {
         "temp: {:.2} top-k: {} top-p: {} repeat-penalty: {:.2} repeat-last-n: {}",
         temperature.unwrap_or(1.0),
         top_k.map(|k| k.to_string()).unwrap_or_else(|| "-".into()),
-        top_p.map(|p| format!("{p:.2}")).unwrap_or_else(|| "-".into()),
+        top_p
+            .map(|p| format!("{p:.2}"))
+            .unwrap_or_else(|| "-".into()),
         args.repeat_penalty,
         args.repeat_last_n,
     );

@@ -174,6 +174,7 @@ impl TextGeneration {
             .to_vec();
 
         let prompt_len = tokens.len();
+        let has_enricher = self.model.has_enricher();
         let mut generated_tokens = 0usize;
         let mut prefill_total = std::time::Duration::ZERO;
         let mut decode_tokens = 0usize;
@@ -191,40 +192,57 @@ impl TextGeneration {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
             let t = std::time::Instant::now();
-            let (logits, fb_stats): (Tensor, Option<FeedbackStats>) = match prev_fb.take() {
-                Some((prev_logits, prev_token)) => {
-                    let (l, s) = self
-                        .model
-                        .forward_feedback(&prev_logits, prev_token, start_pos)?;
-                    (l, Some(s))
+            let (logits, fb_stats): (Tensor, Option<FeedbackStats>) = if has_enricher {
+                // Enricher attached: the prompt is processed by the
+                // sequential forced-token cascade (never the parallel
+                // prefill) and every decode step is enriched from the
+                // previous state.
+                if index == 0 {
+                    let mut last = None;
+                    for (pos, &tok) in tokens.iter().enumerate() {
+                        last = Some(self.model.cascade_step(tok, pos)?);
+                    }
+                    (last.expect("non-empty prompt"), None)
+                } else {
+                    let prev_token = tokens[tokens.len() - 1];
+                    (self.model.cascade_step(prev_token, start_pos)?, None)
                 }
-                None => {
-                    let ctxt = &tokens[start_pos..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    if index == 0 && self.prefill_feedback {
-                        let (l, ps) = self.model.forward_prompt_blend(&input)?;
-                        if self.diagnostics {
-                            if ps.iters > 1 {
-                                let per_iter = ps
-                                    .entropies
-                                    .iter()
-                                    .map(|h| format!("{h:.4}"))
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                eprintln!(
-                                    "# prefill-cascade: iters={}, T={:.4}, mean_H={:.4}, per_iter_H=[{per_iter}]",
-                                    ps.iters, ps.temperature, ps.entropy
-                                );
-                            } else {
-                                eprintln!(
-                                    "# prefill-blend: T={:.4}, mean_H={:.4}",
-                                    ps.temperature, ps.entropy
-                                );
+            } else {
+                match prev_fb.take() {
+                    Some((prev_logits, prev_token)) => {
+                        let (l, s) = self
+                            .model
+                            .forward_feedback(&prev_logits, prev_token, start_pos)?;
+                        (l, Some(s))
+                    }
+                    None => {
+                        let ctxt = &tokens[start_pos..];
+                        let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+                        if index == 0 && self.prefill_feedback {
+                            let (l, ps) = self.model.forward_prompt_blend(&input)?;
+                            if self.diagnostics {
+                                if ps.iters > 1 {
+                                    let per_iter = ps
+                                        .entropies
+                                        .iter()
+                                        .map(|h| format!("{h:.4}"))
+                                        .collect::<Vec<_>>()
+                                        .join(",");
+                                    eprintln!(
+                                        "# prefill-cascade: iters={}, T={:.4}, mean_H={:.4}, per_iter_H=[{per_iter}]",
+                                        ps.iters, ps.temperature, ps.entropy
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "# prefill-blend: T={:.4}, mean_H={:.4}",
+                                        ps.temperature, ps.entropy
+                                    );
+                                }
                             }
+                            (l, None)
+                        } else {
+                            (self.model.forward(&input, start_pos)?, None)
                         }
-                        (l, None)
-                    } else {
-                        (self.model.forward(&input, start_pos)?, None)
                     }
                 }
             };

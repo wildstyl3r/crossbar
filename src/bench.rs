@@ -339,17 +339,13 @@ pub fn run_bench(
         BenchMode { label: "baseline", feedback: None, decode: false, prefill: false },
     ];
     if enricher_path.is_some() {
+        // The enricher mode is the sequential cascade everywhere (prefill
+        // and decode); the hand-set cascade modes do not compose with it.
         modes.push(BenchMode {
             label: "enricher",
             feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.0, 1)),
             decode: true,
             prefill: false,
-        });
-        modes.push(BenchMode {
-            label: "enricher-cascade-k2-a25",
-            feedback: Some(fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.25, 2)),
-            decode: true,
-            prefill: true,
         });
     } else {
         modes.push(BenchMode {
@@ -428,7 +424,7 @@ pub fn run_bench(
         let mut engine = (make_engine)(feedback)?;
         if mode.label.starts_with("enricher") {
             if let Some(path) = enricher_path {
-                engine.set_enricher(path, 192, 8)?;
+                engine.set_enricher(path)?;
                 println!("  enricher: loaded from {path}");
             }
         }
