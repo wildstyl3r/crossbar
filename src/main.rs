@@ -258,6 +258,43 @@ struct Args {
     /// soft-mixture artifact instead of training.
     #[arg(long)]
     train_probe: bool,
+
+    /// Enricher readout rank: 0 = v0 full-rank W (default, unchanged), d > 0
+    /// = factored readout inj = B phi(A shat) with A [d x H], B [H x d]
+    /// (ENRICHER.md, variants v2.1).
+    #[arg(long, default_value_t = 0)]
+    train_enrich_rank: usize,
+
+    /// Nonlinearity inside the bottleneck of a factored readout
+    /// (rank > 0): none = V1 (linear), gelu = V2 (GeluPytorchTanh, matching
+    /// the backbone MLP activation).
+    #[arg(long, value_enum, default_value = "none")]
+    train_enrich_act: EnrichAct,
+
+    /// Per-bottleneck-coordinate content gate conditioned on the incoming
+    /// token (V3; requires rank > 0): u = sigmoid(q Wu + U z + b), inj =
+    /// g B(u * z); the injection penalty stays on the pre-u path.
+    #[arg(long, default_value_t = false)]
+    train_enrich_content_gate: bool,
+
+    /// Treatment of the read-side matrix A (rank > 0): trainable = trained
+    /// jointly with B; fixed = fixed random rows ~ N(0, 1/H); pca = set once
+    /// from a PCA of collected states via a no-grad calibration pass.
+    #[arg(long, value_enum, default_value = "trainable")]
+    train_enrich_a: EnrichAMode,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum EnrichAct {
+    None,
+    Gelu,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum EnrichAMode {
+    Trainable,
+    Fixed,
+    Pca,
 }
 
 enum Engine {
@@ -534,6 +571,19 @@ fn main() -> Result<()> {
     )?)?;
 
     if args.train_enricher {
+        let spec = enrich::EnricherSpec {
+            rank: args.train_enrich_rank,
+            gelu: matches!(args.train_enrich_act, EnrichAct::Gelu),
+            content_gate: args.train_enrich_content_gate,
+            a_mode: match args.train_enrich_a {
+                EnrichAMode::Trainable => enrich::AMode::Trainable,
+                EnrichAMode::Fixed => enrich::AMode::FixedRandom,
+                EnrichAMode::Pca => enrich::AMode::Pca,
+            },
+        };
+        if let Err(e) = spec.validate(engine.hidden()) {
+            anyhow::bail!("invalid enricher spec: {e}");
+        }
         if args.train_probe {
             train::run_probe(
                 &engine,
@@ -567,6 +617,16 @@ fn main() -> Result<()> {
                 grad_clip: args.train_grad_clip,
                 seed: args.train_seed,
                 skip_eval: args.train_skip_eval,
+                spec: enrich::EnricherSpec {
+                    rank: args.train_enrich_rank,
+                    gelu: matches!(args.train_enrich_act, EnrichAct::Gelu),
+                    content_gate: args.train_enrich_content_gate,
+                    a_mode: match args.train_enrich_a {
+                        EnrichAMode::Trainable => enrich::AMode::Trainable,
+                        EnrichAMode::Fixed => enrich::AMode::FixedRandom,
+                        EnrichAMode::Pca => enrich::AMode::Pca,
+                    },
+                },
             },
         )?;
         return Ok(());

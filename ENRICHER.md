@@ -116,6 +116,104 @@ x_t     = q_t + g_t * inj_t
   cascade everywhere (training AND inference; parallel prefill is *never*
   used when the enricher is attached); no auxiliary losses in v0; tau = 8.
 
+## Enricher variants v2.1 (2026-10-08): factored rank-d readout, nonlinearity, content gating
+
+The v2 readout puts 409,600 of its 410,881 params into the full-rank W,
+against <= 32 loss tokens per effective batch — the per-microbatch dL/dW is
+a sum of ~O(50-100) rank-1 outer products, so most of W never earns signal
+(weight decay is all that happens in its null space). The factored form
+concentrates the same learning into 2*d*H entries and doubles as a direct
+test of the module's core hypothesis (the thrown-away "emergent mixture" is
+a low-dim summary). Compute is a non-issue either way: the enricher is
+~0.3-3.3 MFLOPs/step vs ~540 MFLOPs + 1.08 GB weight-streaming for the
+frozen model — wall time and the tau=6 recipe are unchanged, so variant
+comparisons cost nothing extra per run.
+
+Variants (selected by `--train-enrich-rank d`, `--train-enrich-act`,
+`--train-enrich-content-gate`, `--train-enrich-a`):
+
+```
+V0 (default, rank 0):  inj = W shat                        W in R^{640x640}   410,881 params
+V1 (rank d):           inj = B A shat                      A [d,H], B [H,d]   d=64: 83,201
+V2 (V1 + act):         inj = B gelu(A shat)                same params
+V3 (V2 + content gate):u = sigmoid(q Wu + u_z*z + b_u);    + 45,120 (d=64)
+                       inj = g * B(u * z)                  128,321 total
+```
+
+- The scalar gate `g = sigmoid(w_g [q; shat] + b)` is unchanged in all
+  variants — it already conditions on the incoming token; V3 adds
+  *content* selection (which bottleneck features to inject for this token)
+  on top of V2's *magnitude* selection.
+- Init/wakeup identical in every variant: B (or W) zero-init => bit-exact
+  baseline; dL/dB != 0 at init, dL/dA = dL/du = dL/dg = 0 until B moves
+  (measured fresh-init sweep signatures, batch 2, tau=4: V0 w 16.38,
+  V1-d64 b 5.06, V2-d64 b 3.18, V3-d64 b 2.80, PCA-r32 b 16.32 — a/u/gate
+  all 0.000 as designed).
+- Guards port unchanged: the injection penalty measures the pre-gate,
+  pre-u energy `||B phi(A shat)||^2 / ||q||^2` (M1 lesson (a) — u cannot
+  dodge it; one extra [B,d]x[d,H] matmul per step when V3 is on).
+  Contraction picks up a <= 1.1 factor from gelu' (c^6 headroom intact).
+- A treatment (`--train-enrich-a`): `trainable` (default; deterministic
+  per-seed rows ~ N(0, 1/H), ~unit rows), `fixed` (ELM/reservoir reading,
+  only B + gates train), `pca` (A set once from the top-d eigenvectors of
+  the collected states' Gram matrix, then fixed — see below).
+- PCA calibration (`pca`, fresh runs only): one no-grad cascade over the
+  first 16 training batches (~2k state rows at batch 2), top-d
+  orthonormalized power iteration (60 rounds) on the Gram matrix => A rows
+  unit-norm (z coordinates ~unit variance, GELU-healthy). Idempotent on
+  resume (deterministic given the seeded data order), ~2-3 min one-time.
+  PCA-A reads state energy-aligned directions (fresh-init dB 16.3 vs 5.1
+  for random A) — the prior pays off immediately in signal.
+- Checkpoints are self-describing: `enrich.cfg` f32[4] = [rank, gelu,
+  content_gate, a_mode]. v2 checkpoints (enrich.w family, no cfg) load as
+  V0; M1-era files (w_q/w_k/w_v/w_o) are incompatible (expected).
+- Monitoring: the log lines gained a `u` column (mean content-gate value,
+  NaN unless V3). The collapse detector still watches the scalar gate; the
+  pre-u tax keeps B alive even if u closes, so no separate u-abort in v0.
+
+Verified (2026-10-08, all fresh variants): identity regression — baseline,
+fresh V0, fresh V1/V2/V3-d64 and PCA-r32 checkpoints produce bit-identical
+"Once upon a time" greedy output; old-format (cfg-less) V0 loads; resume
+with a mismatched variant bails with a clear error.
+
+### Variant experiment ladder (claims, 2-3 runs each)
+
+1. **d-sweep (V1 linear)**: rank 64 vs 128 (vs 32 if EM-gain is flat) at
+   the standard smoke recipe — if EM-gain grows monotonically to d=256+,
+   the low-dim-mixture hypothesis is falsified; if d=32-64 saturates, the
+   factored form is the better default.
+2. **V2 (bundle)**: same d with `--train-enrich-act gelu` — free capacity
+   widening; compare against the V1 run at equal d.
+3. **V3 (content gate)**: separate claim after V1/V2 verdicts; watch the
+   u column (open-start ~0.88 via u_b = +2), pregate vs applied divergence.
+4. Calibration note: the KV path carries ~68% of the cross-step gradient
+   (tau-sweep) and is untouched by the paramization — expect modest EM
+   deltas from architecture alone; the ladder's main readout is gradient
+   health (grad norms, pregate band, CE trend) + held-out EM.
+
+```sh
+# fresh variant checkpoint + gradient-signature sweep (no training)
+cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
+    --train-enricher --train-steps-warmup 0 --train-steps-st 0 \
+    --train-skip-eval --train-sweep "4:1" --train-batch 2 \
+    --train-enrich-rank 64 --train-enrich-act gelu \
+    --train-out /tmp/enr_v2d64.safetensors
+
+# PCA-calibrated A
+cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
+    --train-enricher --train-steps-warmup 0 --train-steps-st 0 \
+    --train-skip-eval --train-sweep "4:1" --train-batch 2 \
+    --train-enrich-rank 64 --train-enrich-a pca \
+    --train-out /tmp/enr_pca64.safetensors
+
+# overnight variant run (recipe identical to v2; tau=6 exact, batch 4 x accum 4)
+cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
+    --train-enricher --train-steps-warmup 600 --train-steps-st 1800 \
+    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
+    --train-enrich-rank 64 --train-enrich-act gelu \
+    --train-out enricher_v21_r64.safetensors
+```
+
 ## Training as RNN BPTT
 
 Training == inference semantics: a **lockstep batch cascade** over

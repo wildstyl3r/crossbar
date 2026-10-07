@@ -7,7 +7,7 @@ use rand::{Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
 use crate::chat;
-use crate::enrich::Enricher;
+use crate::enrich::{AMode, Enricher, EnricherSpec};
 use crate::Engine;
 
 const TRAIN_PAIRS: usize = 2000;
@@ -49,10 +49,13 @@ pub struct TrainConfig {
     pub sweep: String,
     /// Global-norm gradient clip over the enricher parameters.
     pub grad_clip: f64,
-    /// Seed for the training-data shuffle and the ST sampling rng.
+    /// Seed for the training-data shuffle, the A-matrix init and the ST
+    /// sampling rng.
     pub seed: u64,
     /// Skip the terminal evaluation (smoke runs).
     pub skip_eval: bool,
+    /// Enricher variant (v0 full-rank by default; see EnricherSpec).
+    pub spec: EnricherSpec,
 }
 
 pub struct Example {
@@ -429,12 +432,9 @@ fn tau_sweep(
             t2 - t1,
             rss_mib()
         );
-        // Named per-tensor norms (all_vars() order is HashMap-nondeterministic).
-        let named: [(&str, &candle::Tensor); 3] = [
-            ("w", &enr.w),
-            ("gate_w", &enr.gate_w),
-            ("gate_b", &enr.gate_b),
-        ];
+        // Named per-tensor norms (named_params() order is deterministic,
+        // unlike all_vars()' HashMap order).
+        let named = enr.named_params();
         let mut norms = Vec::new();
         let mut sq = 0f64;
         for (_, t) in &named {
@@ -445,20 +445,24 @@ fn tau_sweep(
             norms.push(n.sqrt());
             sq += n;
         }
-        // Sanity: no gradient outside the module's three params.
+        // Sanity: no gradient outside the trainable params (fixed/PCA A is
+        // intentionally excluded from both sides of the check).
         let mut total_check = 0f64;
-        for var in enr.vars() {
+        for var in enr.trainable_vars() {
             if let Some(g) = grads.get(&var) {
                 total_check += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
             }
         }
         let loss_v = out.ce_value;
+        let per: Vec<String> = named
+            .iter()
+            .zip(&norms)
+            .map(|((n, _), v)| format!("{n} {v:.3}"))
+            .collect();
         println!(
-            "  tau={tau:>2} kv_grad={kv_grad}: ce {loss_v:.4}, grad norm {:.4} (w {:.3}, gate_w {:.3}, gate_b {:.3}){}",
+            "  tau={tau:>2} kv_grad={kv_grad}: ce {loss_v:.4}, grad norm {:.4} ({}){}",
             sq.sqrt(),
-            norms[0],
-            norms[1],
-            norms[2],
+            per.join(", "),
             if total_check - sq > 1e-6 {
                 format!("  [WARN: foreign grads {:.3}]", (total_check - sq).sqrt())
             } else {
@@ -511,6 +515,84 @@ fn maybe_checkpoint(enr: &mut Enricher, last: &mut std::time::Instant, out_path:
     Ok(())
 }
 
+/// PCA calibration of the A matrix (fresh factored runs, a_mode = pca):
+/// collect RMS-normalized states over the first training batches with a
+/// no-grad cascade pass, then set A's rows to the top-`rank` eigenvectors of
+/// the states' Gram matrix (candle has no symeig on CPU, so the top
+/// eigenvectors are found by simultaneous orthogonal iteration — a few
+/// matmuls per round, plenty accurate for a projection basis).
+fn pca_calibrate(engine: &Engine, enr: &mut Enricher, batches: &[Batch]) -> Result<()> {
+    let d = enr.spec().rank;
+    let hidden = enr.hidden();
+    println!(
+        "train: PCA calibration of A (rank {d}) over the first {} batches...",
+        PCA_BATCHES.min(batches.len())
+    );
+    enr.set_collect_shat(true);
+    let mut rng = StdRng::seed_from_u64(4242);
+    for batch in batches.iter().take(PCA_BATCHES.min(batches.len())) {
+        engine.cascade_train_forward(
+            enr,
+            &batch.input_ids,
+            &batch.targets,
+            batch.answer_start,
+            0, // no TBPTT window: pure forward, states collected
+            false,
+            1.0,
+            1.0,
+            &mut rng,
+        )?;
+    }
+    enr.set_collect_shat(false);
+    let (gram, n_rows) = enr
+        .take_gram()
+        .context("PCA calibration collected no states")?;
+    println!("  collected {n_rows} state rows");
+
+    // Power-style iteration: orthonormalize an initial [H, d] guess, then
+    // repeatedly (gram, orthonormalize). Gram is symmetric PSD by
+    // construction.
+    let seed_a = crate::enrich::randn_rows(hidden, d, 1.0, 4243)?;
+    let mut v = orthonormalize(&seed_a)?;
+    for it in 0..PCA_ITERS {
+        v = orthonormalize(&gram.matmul(&v)?)?;
+        if it % 10 == 0 || it == PCA_ITERS - 1 {
+            // Rayleigh-ish residual: relative change between iterations.
+            let nv = orthonormalize(&gram.matmul(&v)?)?;
+            let diff = nv.sub(&v)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            println!("  pca iter {it}: subspace delta {:.3e}", diff.sqrt());
+            v = nv;
+        }
+    }
+    // A rows = top-d eigenvectors (columns of v), transposed to [d, H].
+    let a = v.t()?.contiguous()?;
+    enr.set_a(&a)?;
+    Ok(())
+}
+
+const PCA_BATCHES: usize = 16;
+const PCA_ITERS: usize = 60;
+
+/// Gram-Schmidt orthonormalization of the columns of an [H, d] matrix.
+fn orthonormalize(m: &Tensor) -> Result<Tensor> {
+    let (h, d) = m.dims2()?;
+    let mut cols: Vec<Tensor> = Vec::with_capacity(d);
+    for j in 0..d {
+        let mut c = m.narrow(1, j, 1)?.squeeze(1)?; // [H]
+        for p in &cols {
+            let dot = p.broadcast_mul(&c)?.sum_all()?.to_scalar::<f32>()?;
+            c = c.sub(&p.affine(dot as f64, 0.0)?)?;
+        }
+        let norm = c.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt().max(1e-9);
+        cols.push(c.affine(1.0 / norm as f64, 0.0)?);
+    }
+    let cols: Vec<Tensor> = cols
+        .into_iter()
+        .map(|c| c.reshape((h, 1)))
+        .collect::<candle::Result<_>>()?;
+    Ok(Tensor::cat(&cols, 1)?)
+}
+
 pub fn run(
     engine: &mut Engine,
     tokenizer: &Tokenizer,
@@ -529,22 +611,41 @@ pub fn run(
     let fresh = match std::path::Path::new(out_path).exists() {
         true => {
             println!("train: resuming from existing checkpoint {out_path}");
-            Enricher::load(out_path)?
+            let loaded = Enricher::load(out_path)?;
+            if loaded.spec() != &cfg.spec {
+                anyhow::bail!(
+                    "checkpoint variant {:?} != requested {:?} (delete {} to restart)",
+                    loaded.spec(),
+                    cfg.spec,
+                    out_path
+                );
+            }
+            loaded
         }
         false => {
-            let e = Enricher::new(engine.hidden(), cfg.gate_bias, &Device::Cpu)?;
+            let e = Enricher::new(engine.hidden(), cfg.gate_bias, cfg.spec, cfg.seed)?;
             // Save the fresh (identity) checkpoint before any training so the
             // bit-exact baseline regression has a loadable artifact.
             e.save(out_path)?;
-            println!("train: fresh enricher saved to {out_path} (W=0 identity)");
+            println!(
+                "train: fresh enricher saved to {out_path} ({} identity)",
+                if cfg.spec.rank == 0 { "W=0" } else { "B=0" }
+            );
             e
         }
     };
     let mut enr = fresh;
-    let vars = enr.vars();
-    let mut opt = candle_nn::AdamW::new_lr(vars, 1e-3)?;
+    let n_params: usize = enr
+        .named_params()
+        .iter()
+        .map(|(_, t)| t.elem_count())
+        .sum();
+    let vars = enr.trainable_vars();
+    let mut opt = candle_nn::AdamW::new_lr(vars.clone(), 1e-3)?;
     println!(
-        "train: enricher v2 (bias {:.2}, lr_warmup {}, floor {:.2}, gt {:.2}->{:.2}, tau {}, clip {:.2}, seed {})",
+        "train: enricher {} (params {}, bias {:.2}, lr_warmup {}, floor {:.2}, gt {:.2}->{:.2}, tau {}, clip {:.2}, seed {})",
+        cfg.spec.summary(),
+        n_params,
         cfg.gate_bias, cfg.lr_warmup, cfg.gate_floor, cfg.gt_start, cfg.gt_end,
         cfg.tau, cfg.grad_clip, cfg.seed
     );
@@ -559,6 +660,14 @@ pub fn run(
         cfg.batch,
         cfg.accum
     );
+    // PCA calibration of A (fresh factored runs only): one no-grad cascade
+    // over the first batches collecting RMS-normalized states, then the top-d
+    // eigenvectors of the Gram matrix become A's rows.
+    if cfg.spec.rank > 0 && cfg.spec.a_mode == AMode::Pca {
+        pca_calibrate(engine, &mut enr, &batches)?;
+        enr.save(out_path)?;
+        println!("train: PCA-calibrated checkpoint saved to {out_path}");
+    }
     let total_batches = batches.len();
     let start = std::time::Instant::now();
     let mut last_checkpoint = start;
@@ -571,7 +680,6 @@ pub fn run(
     let mut acc: std::collections::HashMap<candle::TensorId, candle::Tensor> =
         std::collections::HashMap::new();
     let mut micro = 0usize;
-    let vars = enr.vars();
 
     // TBPTT truncation + KV-path diagnostic before any training. Default
     // grid: the exact-gradient reference at tau=4 plus the training config.
@@ -645,11 +753,13 @@ pub fn run(
         loss_n += 1;
         if wi % 10 == 0 {
             let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
+            let um = enr.take_content_gate_mean().unwrap_or(f64::NAN);
             println!(
-                "  warmup {wi:>4}: loss {:.4} (lr {:.2e}, gate {:.3}, pregate {:.3}, |g| {:.3}) [{:.0}s, rss {:.0} MiB]",
+                "  warmup {wi:>4}: loss {:.4} (lr {:.2e}, gate {:.3}, u {:.3}, pregate {:.3}, |g| {:.3}) [{:.0}s, rss {:.0} MiB]",
                 loss_sum / loss_n.max(1) as f64,
                 lr,
                 gm,
+                um,
                 pen_sum / loss_n.max(1) as f64,
                 gnorm_sum / step_n.max(1) as f64,
                 start.elapsed().as_secs_f64(),
@@ -719,11 +829,13 @@ pub fn run(
         loss_n += 1;
         if si % 10 == 0 {
             let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
+            let um = enr.take_content_gate_mean().unwrap_or(f64::NAN);
             println!(
-                "  st {si:>4}: loss {:.4} (lr {:.2e}, gt {gt:.2}, forced {forced_prob:.2}, gate {:.3}, pregate {:.3}, appl p/ans {:.3}/{:.3}, |g| {:.3}) [{:.0}s]",
+                "  st {si:>4}: loss {:.4} (lr {:.2e}, gt {gt:.2}, forced {forced_prob:.2}, gate {:.3}, u {:.3}, pregate {:.3}, appl p/ans {:.3}/{:.3}, |g| {:.3}) [{:.0}s]",
                 loss_sum / loss_n.max(1) as f64,
                 lr,
                 gm,
+                um,
                 pen_sum / loss_n.max(1) as f64,
                 ap,
                 aa,
@@ -759,7 +871,7 @@ pub fn run(
     }
 
     println!("train: held-out evaluation");
-    let baseline = Enricher::new(engine.hidden(), 0.0, &Device::Cpu)?;
+    let baseline = Enricher::new(engine.hidden(), 0.0, EnricherSpec::default(), 0)?;
     let base_tf = teacher_forced_em(engine, &eval_batches, device, &baseline)?;
     let trained_tf = teacher_forced_em(engine, &eval_batches, device, &enr)?;
     println!(
