@@ -2,16 +2,14 @@ use anyhow::{Context, Error as E, Result};
 use candle::backprop::GradStore;
 use candle::{DType, Device, Tensor};
 use candle_nn::Optimizer;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
+use crate::Engine;
 use crate::chat;
 use crate::enrich::{AMode, Enricher, EnricherSpec};
-use crate::Engine;
-
-const TRAIN_PAIRS: usize = 2000;
-const HELDOUT_PAIRS: usize = 100;
+use crate::tasks::{Example, HELDOUT_PAIRS, TRAIN_PAIRS, build_dataset, score, shuffle};
 
 /// Training hyperparameters. Defaults restore the healthy-warmup recipe
 /// (gate bias +2 open-start, lr ramp 50, gate floor 0.5) with the v2
@@ -58,179 +56,13 @@ pub struct TrainConfig {
     pub spec: EnricherSpec,
 }
 
-pub struct Example {
-    pub task: &'static str,
-    pub prompt: String,
-    pub answer: String,
-}
-
-const AGENTS: &[&str] = &["zorp", "kit", "milu"];
-const OBJECTS: &[&str] = &["blicket", "murble", "wug", "toma"];
-
-fn shuffle<T>(v: &mut [T], rng: &mut StdRng) {
-    for i in (1..v.len()).rev() {
-        v.swap(i, rng.random_range(0..=i));
-    }
-}
-
-/// Chain-of-custody state tracking: statements move objects between holders;
-/// the question asks who has one object. Depth-2/3 chains for the target
-/// object, one distractor statement about a second object.
-fn build_state_track(rng: &mut StdRng) -> Example {
-    let mut holders: Vec<&str> = AGENTS.to_vec();
-    shuffle(&mut holders, rng);
-    let mut objects: Vec<&str> = OBJECTS.to_vec();
-    shuffle(&mut objects, rng);
-    let target_obj = objects[0];
-    let distractor_obj = objects[1];
-    let depth = rng.random_range(2..=3usize);
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("The {target_obj} is with {}.", holders[0]));
-    lines.push(format!("The {distractor_obj} is with {}.", holders[2]));
-    let mut cur = holders[0];
-    for step in 0..depth {
-        let next = holders[1 + (step % 2)];
-        lines.push(format!("{cur} gives the {target_obj} to {next}."));
-        cur = next;
-    }
-    lines.push(format!("{} takes the {distractor_obj}.", holders[2]));
-    let answer = {
-        let mut c = cur.chars();
-        match c.next() {
-            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            None => String::new(),
-        }
-    };
-    shuffle(&mut lines, rng);
-    Example {
-        task: "state-track",
-        prompt: format!(
-            "{}\nQuestion: who has the {target_obj}?\nAnswer with only the name.",
-            lines.join(" ")
-        ),
-        answer,
-    }
-}
-
-const NONSENSE: &[&str] = &[
-    "dax", "wug", "zorpie", "toma", "rugg", "fep", "kiki", "gorb", "pil", "nad", "mell", "lorp",
-    "seng", "tob", "cootie",
-];
-
-/// Induction with distractors: 6 relevant word->number statements plus 2-3
-/// distractor statements; the 6th relevant pair is queried.
-fn build_induce_d(rng: &mut StdRng) -> Example {
-    let mut pool = NONSENSE.to_vec();
-    shuffle(&mut pool, rng);
-    let chosen: Vec<&str> = pool[..6].to_vec();
-    let distractors: Vec<&str> = pool[6..9].to_vec();
-    let numbers: Vec<i64> = (0..6).map(|_| rng.random_range(1..100)).collect();
-    let mut stmts: Vec<String> = chosen
-        .iter()
-        .zip(&numbers)
-        .map(|(w, n)| format!("{w} is {n}"))
-        .collect();
-    let n_distract = rng.random_range(2..=3usize);
-    for d in distractors.iter().take(n_distract) {
-        stmts.push(format!("{d} is red."));
-    }
-    shuffle(&mut stmts, rng);
-    let query = chosen[5];
-    let answer = numbers[5].to_string();
-    Example {
-        task: "induce-d",
-        prompt: format!(
-            "{}.\nQuestion: {query} is?\nAnswer with only the number.",
-            stmts.join(". ")
-        ),
-        answer,
-    }
-}
-
-fn build_dataset() -> (Vec<Example>, Vec<Example>) {
-    let mut rng = StdRng::seed_from_u64(777);
-    let mut train = Vec::new();
-    for _ in 0..TRAIN_PAIRS {
-        train.push(build_state_track(&mut rng));
-        train.push(build_induce_d(&mut rng));
-    }
-    // Held-out hygiene: the generators are small-combinatorial-space tasks
-    // (state-track's distinct-prompt space is ~1e5, with 4k train draws), so
-    // a plain sequential split leaves ~3% of held-out state-track prompts as
-    // literal training prompts. Redraw any held-out example whose prompt
-    // string duplicates a training example (or an earlier held-out one).
-    let mut seen: std::collections::HashSet<String> =
-        train.iter().map(|e| e.prompt.clone()).collect();
-    let mut heldout = Vec::new();
-    let mut n_replaced = 0usize;
-    for _ in 0..HELDOUT_PAIRS {
-        let mut st = build_state_track(&mut rng);
-        while seen.contains(&st.prompt) {
-            n_replaced += 1;
-            st = build_state_track(&mut rng);
-        }
-        seen.insert(st.prompt.clone());
-        heldout.push(st);
-        let mut id = build_induce_d(&mut rng);
-        while seen.contains(&id.prompt) {
-            n_replaced += 1;
-            id = build_induce_d(&mut rng);
-        }
-        seen.insert(id.prompt.clone());
-        heldout.push(id);
-    }
-    if n_replaced > 0 {
-        eprintln!("dataset: redrew {n_replaced} held-out prompts that duplicated training examples");
-    }
-    (train, heldout)
-}
-
-fn first_nonempty_line(text: &str) -> &str {
-    text.lines()
-        .find(|l| !l.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("")
-}
-
-fn last_int(s: &str) -> Option<i64> {
-    let mut last = None;
-    let mut cur: Option<i64> = None;
-    for c in s.chars() {
-        if let Some(d) = c.to_digit(10) {
-            cur = Some(cur.unwrap_or(0).saturating_mul(10).saturating_add(d as i64));
-        } else if let Some(v) = cur.take() {
-            last = Some(v);
-        }
-    }
-    if let Some(v) = cur {
-        last = Some(v);
-    }
-    last
-}
-
-/// Exact-match scoring for the two task families.
-fn score(task: &str, answer: &str, text: &str) -> bool {
-    let line = first_nonempty_line(text).to_lowercase();
-    match task {
-        "state-track" => {
-            let words: Vec<String> = line
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-                .collect::<String>()
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
-            let answer_lc = answer.to_lowercase();
-            words.iter().any(|w| *w == answer_lc)
-        }
-        _ => last_int(&line) == answer.parse::<i64>().ok(),
-    }
-}
-
 fn encode_answer(tokenizer: &Tokenizer, ex: &Example) -> Result<Vec<u32>> {
     let text = format!("{} <end_of_turn>", ex.answer);
-    let ids = tokenizer.encode(text.as_str(), false).map_err(E::msg)?.get_ids().to_vec();
+    let ids = tokenizer
+        .encode(text.as_str(), false)
+        .map_err(E::msg)?
+        .get_ids()
+        .to_vec();
     Ok(ids)
 }
 
@@ -303,11 +135,7 @@ fn make_batches(
 
 /// Global-norm gradient clipping over the given parameters. Returns the
 /// pre-clip norm (for logging).
-fn clip_grads_gradstore(
-    grads: &mut GradStore,
-    vars: &[candle::Var],
-    max_norm: f64,
-) -> Result<f64> {
+fn clip_grads_gradstore(grads: &mut GradStore, vars: &[candle::Var], max_norm: f64) -> Result<f64> {
     let mut sq = 0f64;
     let mut per_var: Vec<(candle::Var, f64)> = Vec::new();
     for var in vars {
@@ -370,7 +198,13 @@ fn train_backward(
         loss = loss.affine(1.0 / accum as f64, 0.0)?;
     }
     let grads = loss.backward()?;
-    Ok((out.ce_value, pen_v, out.applied_prompt, out.applied_answer, grads))
+    Ok((
+        out.ce_value,
+        pen_v,
+        out.applied_prompt,
+        out.applied_answer,
+        grads,
+    ))
 }
 
 /// Merge one micro-step's enricher grads into the accumulator.
@@ -418,7 +252,7 @@ fn accum_step(
 /// grid of (tau, kv_grad) configs and compare the per-tensor gradient norms
 /// against the first (reference) config. If a cheaper config's gradient is
 /// >= 99% of the reference per tensor, it captures the gradient (see
-/// ENRICHER.md).
+/// > ENRICHER.md).
 fn tau_sweep(
     engine: &Engine,
     enr: &Enricher,
@@ -529,7 +363,11 @@ fn rss_mib() -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-fn maybe_checkpoint(enr: &mut Enricher, last: &mut std::time::Instant, out_path: &str) -> Result<()> {
+fn maybe_checkpoint(
+    enr: &mut Enricher,
+    last: &mut std::time::Instant,
+    out_path: &str,
+) -> Result<()> {
     if last.elapsed() >= std::time::Duration::from_secs(300) {
         enr.save(out_path)?;
         *last = std::time::Instant::now();
@@ -616,6 +454,7 @@ fn orthonormalize(m: &Tensor) -> Result<Tensor> {
     Ok(Tensor::cat(&cols, 1)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     engine: &mut Engine,
     tokenizer: &Tokenizer,
@@ -658,19 +497,21 @@ pub fn run(
         }
     };
     let mut enr = fresh;
-    let n_params: usize = enr
-        .named_params()
-        .iter()
-        .map(|(_, t)| t.elem_count())
-        .sum();
+    let n_params: usize = enr.named_params().iter().map(|(_, t)| t.elem_count()).sum();
     let vars = enr.trainable_vars();
     let mut opt = candle_nn::AdamW::new_lr(vars.clone(), 1e-3)?;
     println!(
         "train: enricher {} (params {}, bias {:.2}, lr_warmup {}, floor {:.2}, gt {:.2}->{:.2}, tau {}, clip {:.2}, seed {})",
         cfg.spec.summary(),
         n_params,
-        cfg.gate_bias, cfg.lr_warmup, cfg.gate_floor, cfg.gt_start, cfg.gt_end,
-        cfg.tau, cfg.grad_clip, cfg.seed
+        cfg.gate_bias,
+        cfg.lr_warmup,
+        cfg.gate_floor,
+        cfg.gt_start,
+        cfg.gt_end,
+        cfg.tau,
+        cfg.grad_clip,
+        cfg.seed
     );
 
     let mut sample_rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(1));
@@ -778,9 +619,7 @@ pub fn run(
         if wi % 10 == 0 {
             let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
             let um = enr.take_content_gate_mean().unwrap_or(f64::NAN);
-            let (am, rm, dg) = enr
-                .take_residual_stats()
-                .unwrap_or((f64::NAN, f64::NAN, 0));
+            let (am, rm, dg) = enr.take_residual_stats().unwrap_or((f64::NAN, f64::NAN, 0));
             let dg_s = if dg > 0 {
                 format!(" [degen {dg}]")
             } else {
@@ -862,9 +701,7 @@ pub fn run(
         if si % 10 == 0 {
             let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
             let um = enr.take_content_gate_mean().unwrap_or(f64::NAN);
-            let (am, rm, dg) = enr
-                .take_residual_stats()
-                .unwrap_or((f64::NAN, f64::NAN, 0));
+            let (am, rm, dg) = enr.take_residual_stats().unwrap_or((f64::NAN, f64::NAN, 0));
             let dg_s = if dg > 0 {
                 format!(" [degen {dg}]")
             } else {
@@ -923,13 +760,39 @@ pub fn run(
     println!("train: saved enricher to {out_path}");
 
     engine.attach_enricher(baseline)?;
-    let base_fr = free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, false)?;
-    let base_fr_guided =
-        free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, true)?;
+    let base_fr = free_running_eval(
+        engine,
+        tokenizer,
+        chat_template,
+        &eval_examples,
+        device,
+        false,
+    )?;
+    let base_fr_guided = free_running_eval(
+        engine,
+        tokenizer,
+        chat_template,
+        &eval_examples,
+        device,
+        true,
+    )?;
     engine.attach_enricher(enr)?;
-    let trained_fr = free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, false)?;
-    let trained_fr_guided =
-        free_running_eval(engine, tokenizer, chat_template, &eval_examples, device, true)?;
+    let trained_fr = free_running_eval(
+        engine,
+        tokenizer,
+        chat_template,
+        &eval_examples,
+        device,
+        false,
+    )?;
+    let trained_fr_guided = free_running_eval(
+        engine,
+        tokenizer,
+        chat_template,
+        &eval_examples,
+        device,
+        true,
+    )?;
     println!(
         "train: free-running EM: baseline {:.1}% -> trained {:.1}% (first-token-guided: baseline {:.1}% -> trained {:.1}%)",
         100.0 * base_fr,
@@ -964,7 +827,11 @@ fn teacher_forced_em(
             1.0,
             &mut rng,
         )?;
-        let preds = out.logits.to_dtype(DType::F32)?.argmax(2)?.to_vec2::<u32>()?;
+        let preds = out
+            .logits
+            .to_dtype(DType::F32)?
+            .argmax(2)?
+            .to_vec2::<u32>()?;
         let targets = batch.targets.to_vec2::<i64>()?;
         for (row, tgt_row) in targets.iter().enumerate() {
             for (slot, &t) in tgt_row.iter().enumerate() {
@@ -1023,8 +890,7 @@ fn free_running_eval(
         }
         let mut logits = logits.context("empty prompt")?;
         let mut text = String::new();
-        let mut pos = prompt_tokens.len();
-        for step in 0..8 {
+        for (pos, step) in (prompt_tokens.len()..).zip(0..8) {
             let lg = logits
                 .squeeze(0)?
                 .squeeze(0)?
@@ -1033,7 +899,7 @@ fn free_running_eval(
             let argmax = lg
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .max_by(|a, b| a.1.total_cmp(b.1))
                 .unwrap()
                 .0 as u32;
             let best = if step == 0 {
@@ -1046,7 +912,6 @@ fn free_running_eval(
             }
             text.push_str(&tokenizer.decode(&[best], true).unwrap_or_default());
             logits = engine.cascade_step(best, pos)?;
-            pos += 1;
         }
         if score(ex.task, &ex.answer, &text) {
             correct += 1;
@@ -1102,9 +967,7 @@ pub fn run_probe(
     }
     let n = n_batches as f64;
     let gate = enr.take_gate_mean();
-    let (am, rm, dg) = enr
-        .take_residual_stats()
-        .unwrap_or((f64::NAN, f64::NAN, 0));
+    let (am, rm, dg) = enr.take_residual_stats().unwrap_or((f64::NAN, f64::NAN, 0));
     println!(
         "probe: gate {:?} | pregate rel {:.3} | applied rel prompt {:.3} / answer {:.3} | alpha {am:.3} rem {rm:.3} degen {dg} | ce {:.3}",
         gate,

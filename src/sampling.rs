@@ -73,7 +73,10 @@ impl LogitsProcessor {
                 return i as u32;
             }
         }
-        indices.last().map(|&i| i as u32).unwrap_or_else(|| argmax(logits))
+        indices
+            .last()
+            .map(|&i| i as u32)
+            .unwrap_or_else(|| argmax(logits))
     }
 }
 
@@ -97,5 +100,42 @@ pub fn apply_repeat_penalty(logits: &mut [f32], penalty: f32, context: &[u32]) {
                 *logit *= penalty;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_picks_argmax() {
+        let mut p = LogitsProcessor::new(0, Some(0.0), None, None);
+        let mut lg = vec![0.1f32, 2.0, -1.0, 0.5];
+        assert_eq!(p.sample(&mut lg), 1);
+    }
+
+    #[test]
+    fn top_k_one_picks_argmax() {
+        let mut p = LogitsProcessor::new(42, Some(1.0), Some(1), None);
+        let mut lg = vec![0.1f32, 2.0, -1.0, 0.5];
+        assert_eq!(p.sample(&mut lg), 1);
+    }
+
+    #[test]
+    fn sample_is_deterministic_per_seed() {
+        let mut a = LogitsProcessor::new(7, Some(1.5), Some(3), Some(0.9));
+        let mut b = LogitsProcessor::new(7, Some(1.5), Some(3), Some(0.9));
+        let mut la = vec![0.1f32, 2.0, -1.0, 0.5, 1.7];
+        let mut lb = la.clone();
+        assert_eq!(a.sample(&mut la), b.sample(&mut lb));
+    }
+
+    #[test]
+    fn repeat_penalty_downweights_context_tokens() {
+        let mut lg = vec![1.0f32, -2.0, 0.5];
+        apply_repeat_penalty(&mut lg, 2.0, &[1]);
+        assert_eq!(lg[0], 1.0);
+        assert!((lg[1] - (-4.0)).abs() < 1e-6);
+        assert!((lg[2] - 0.5).abs() < 1e-6);
     }
 }

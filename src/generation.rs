@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use std::io::Write;
 use tokenizers::Tokenizer;
 
-use crate::model::FeedbackStats;
 use crate::Engine;
-use crate::sampling::{apply_repeat_penalty, LogitsProcessor};
+use crate::model::FeedbackStats;
+use crate::sampling::{LogitsProcessor, apply_repeat_penalty};
 
 pub struct TokenOutputStream {
     tokenizer: Tokenizer,
@@ -210,9 +210,9 @@ impl TextGeneration {
             } else {
                 match prev_fb.take() {
                     Some((prev_logits, prev_token)) => {
-                        let (l, s) = self
-                            .model
-                            .forward_feedback(&prev_logits, prev_token, start_pos)?;
+                        let (l, s) =
+                            self.model
+                                .forward_feedback(&prev_logits, prev_token, start_pos)?;
                         (l, Some(s))
                     }
                     None => {
@@ -334,7 +334,13 @@ impl TextGeneration {
                     1.0
                 };
                 let (t_used, h_fb, support, norm_x, cos_prev) = match fb_stats {
-                    Some(s) => (s.temperature, s.entropy, s.support, s.input_norm, s.cosine_prev),
+                    Some(s) => (
+                        s.temperature,
+                        s.entropy,
+                        s.support,
+                        s.input_norm,
+                        s.cosine_prev,
+                    ),
                     None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
                 };
                 eprintln!(
@@ -345,9 +351,7 @@ impl TextGeneration {
             if self.eos_tokens.contains(&next_token) {
                 break;
             }
-            if stream
-                && let Some(t) = self.tokenizer.next_token(next_token)?
-            {
+            if stream && let Some(t) = self.tokenizer.next_token(next_token)? {
                 print!("{t}");
                 std::io::stdout().flush()?;
             }
@@ -397,9 +401,9 @@ impl TextGeneration {
             let decode_ms = timing.decode_total.as_secs_f64() * 1000.0;
             let forward_ms = timing.decode_forward.as_secs_f64() * 1000.0;
             let sample_ms = timing.decode_sample.as_secs_f64() * 1000.0;
-            let output_ms =
-                (timing.decode_total - timing.decode_forward - timing.decode_sample).as_secs_f64()
-                    * 1000.0;
+            let output_ms = (timing.decode_total - timing.decode_forward - timing.decode_sample)
+                .as_secs_f64()
+                * 1000.0;
             let pct = |ms: f64| 100.0 * ms / decode_ms.max(f64::MIN_POSITIVE);
             println!(
                 "decode: {} tokens, avg {:.2} ms/token ({:.2} token/s) | \

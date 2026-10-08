@@ -6,10 +6,11 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
+use crate::Engine;
 use crate::chat;
 use crate::generation::TextGeneration;
 use crate::model::{FeedbackConfig, FeedbackTempMode};
-use crate::Engine;
+use crate::tasks::{first_nonempty_line, last_int, shuffle};
 
 struct BenchMode {
     label: &'static str,
@@ -56,12 +57,6 @@ struct Example {
     max_tokens: usize,
 }
 
-fn shuffle<T>(v: &mut [T], rng: &mut StdRng) {
-    for i in (1..v.len()).rev() {
-        v.swap(i, rng.random_range(0..=i));
-    }
-}
-
 fn build_examples(n: usize) -> Vec<Example> {
     let mut examples = Vec::new();
 
@@ -73,13 +68,17 @@ fn build_examples(n: usize) -> Vec<Example> {
         };
         let mut rng = StdRng::seed_from_u64(1000 + len as u64);
         for id in 0..n {
-            let digits: Vec<String> = (0..len).map(|_| rng.random_range(0..10).to_string()).collect();
+            let digits: Vec<String> = (0..len)
+                .map(|_| rng.random_range(0..10).to_string())
+                .collect();
             let target = digits.join("");
             let shown = digits.join(" ");
             examples.push(Example {
                 task,
                 id,
-                prompt: format!("Repeat these digits in order: {shown}. Answer with only the digits."),
+                prompt: format!(
+                    "Repeat these digits in order: {shown}. Answer with only the digits."
+                ),
                 target: Target::Digits(target),
                 max_tokens: 2 * len + 12,
             });
@@ -185,31 +184,64 @@ fn build_examples(n: usize) -> Vec<Example> {
     const TRIVIA: &[(&str, Target)] = &[
         ("What is the capital of France?", Target::Text(&["paris"])),
         ("What is the capital of Germany?", Target::Text(&["berlin"])),
-        ("What is the capital of Italy?", Target::Text(&["rome", "roma"])),
+        (
+            "What is the capital of Italy?",
+            Target::Text(&["rome", "roma"]),
+        ),
         ("What is the capital of Spain?", Target::Text(&["madrid"])),
-        ("What is the capital of Portugal?", Target::Text(&["lisbon"])),
+        (
+            "What is the capital of Portugal?",
+            Target::Text(&["lisbon"]),
+        ),
         ("What is the capital of Japan?", Target::Text(&["tokyo"])),
-        ("What is the capital of China?", Target::Text(&["beijing", "peking"])),
+        (
+            "What is the capital of China?",
+            Target::Text(&["beijing", "peking"]),
+        ),
         ("What is the capital of Russia?", Target::Text(&["moscow"])),
         ("What is the capital of Greece?", Target::Text(&["athens"])),
         ("What is the capital of Poland?", Target::Text(&["warsaw"])),
-        ("What is the capital of Sweden?", Target::Text(&["stockholm"])),
+        (
+            "What is the capital of Sweden?",
+            Target::Text(&["stockholm"]),
+        ),
         ("What is the capital of Norway?", Target::Text(&["oslo"])),
-        ("What is the capital of the Netherlands?", Target::Text(&["amsterdam"])),
-        ("What is the capital of Austria?", Target::Text(&["vienna", "wien"])),
+        (
+            "What is the capital of the Netherlands?",
+            Target::Text(&["amsterdam"]),
+        ),
+        (
+            "What is the capital of Austria?",
+            Target::Text(&["vienna", "wien"]),
+        ),
         ("What is the capital of Egypt?", Target::Text(&["cairo"])),
         ("What is the capital of Canada?", Target::Text(&["ottawa"])),
-        ("What is the capital of Australia?", Target::Text(&["canberra"])),
-        ("What is the capital of Brazil?", Target::Text(&["brasilia"])),
-        ("What is the capital of Mexico?", Target::Text(&["mexico city"])),
-        ("What is the capital of Switzerland?", Target::Text(&["bern", "berne"])),
+        (
+            "What is the capital of Australia?",
+            Target::Text(&["canberra"]),
+        ),
+        (
+            "What is the capital of Brazil?",
+            Target::Text(&["brasilia"]),
+        ),
+        (
+            "What is the capital of Mexico?",
+            Target::Text(&["mexico city"]),
+        ),
+        (
+            "What is the capital of Switzerland?",
+            Target::Text(&["bern", "berne"]),
+        ),
         ("How many legs does a spider have?", Target::Num(8)),
         ("How many days are in a week?", Target::Num(7)),
         ("How many continents are there on Earth?", Target::Num(7)),
         ("How many sides does a triangle have?", Target::Num(3)),
         ("How many minutes are in an hour?", Target::Num(60)),
         ("How many hours are in a day?", Target::Num(24)),
-        ("How many strings does a standard guitar have?", Target::Num(6)),
+        (
+            "How many strings does a standard guitar have?",
+            Target::Num(6),
+        ),
         (
             "How many players of one soccer team are on the field at the same time?",
             Target::Num(11),
@@ -273,29 +305,6 @@ fn build_examples(n: usize) -> Vec<Example> {
     examples
 }
 
-fn first_nonempty_line(text: &str) -> &str {
-    text.lines()
-        .find(|l| !l.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("")
-}
-
-fn last_int(s: &str) -> Option<i64> {
-    let mut last = None;
-    let mut cur: Option<i64> = None;
-    for c in s.chars() {
-        if let Some(d) = c.to_digit(10) {
-            cur = Some(cur.unwrap_or(0).saturating_mul(10).saturating_add(d as i64));
-        } else if let Some(v) = cur.take() {
-            last = Some(v);
-        }
-    }
-    if let Some(v) = cur {
-        last = Some(v);
-    }
-    last
-}
-
 fn normalize_words(s: &str) -> Vec<String> {
     s.to_lowercase()
         .chars()
@@ -321,12 +330,18 @@ fn score(ex: &Example, text: &str) -> (bool, String) {
     let line = first_nonempty_line(text);
     match &ex.target {
         Target::Digits(t) => {
-            let got = line.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+            let got = line
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>();
             (got == *t, got)
         }
         Target::Num(n) => {
             let got = last_int(line);
-            (got == Some(*n), got.map(|v| v.to_string()).unwrap_or_default())
+            (
+                got == Some(*n),
+                got.map(|v| v.to_string()).unwrap_or_default(),
+            )
         }
         Target::Text(alts) => {
             let words = normalize_words(line);
@@ -368,6 +383,7 @@ fn mcnemar_p(n01: usize, n10: usize) -> f64 {
     (p * 2f64.powi(-(n as i32)) * 2.0).min(1.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     make_engine: &dyn Fn(FeedbackConfig) -> Result<Engine>,
     tokenizer: Tokenizer,
@@ -402,9 +418,12 @@ pub fn run_bench(
         }
         examples
     };
-    let mut modes = vec![
-        BenchMode { label: "baseline", feedback: None, decode: false, prefill: false },
-    ];
+    let mut modes = vec![BenchMode {
+        label: "baseline",
+        feedback: None,
+        decode: false,
+        prefill: false,
+    }];
     if enricher_path.is_some() {
         // The enricher mode is the sequential cascade everywhere (prefill
         // and decode); the hand-set cascade modes do not compose with it.
@@ -473,8 +492,8 @@ pub fn run_bench(
         modes.len()
     );
 
-    let mut csv = std::fs::File::create(out_path)
-        .with_context(|| format!("cannot create {out_path}"))?;
+    let mut csv =
+        std::fs::File::create(out_path).with_context(|| format!("cannot create {out_path}"))?;
     writeln!(
         csv,
         "task,mode,id,prompt,target,prediction,correct,gen_tokens,mean_hfb,mean_raw_h"
@@ -489,11 +508,11 @@ pub fn run_bench(
             .feedback
             .unwrap_or_else(|| fb_config(FeedbackTempMode::Fixed, 1.0, 2.5, 1.0, 0.0, 1));
         let mut engine = (make_engine)(feedback)?;
-        if mode.label.starts_with("enricher") {
-            if let Some(path) = enricher_path {
-                engine.set_enricher(path)?;
-                println!("  enricher: loaded from {path}");
-            }
+        if mode.label.starts_with("enricher")
+            && let Some(path) = enricher_path
+        {
+            engine.set_enricher(path)?;
+            println!("  enricher: loaded from {path}");
         }
         let mut pipeline = TextGeneration::new(
             engine,
@@ -570,10 +589,20 @@ pub fn run_bench(
         for (mi, _) in modes.iter().enumerate() {
             let correct = idxs.iter().filter(|&&i| results[mi][i]).count();
             let cell = if mi == 0 {
-                format!("{:.0}% (n={})", 100.0 * correct as f64 / idxs.len() as f64, idxs.len())
+                format!(
+                    "{:.0}% (n={})",
+                    100.0 * correct as f64 / idxs.len() as f64,
+                    idxs.len()
+                )
             } else {
-                let n01 = idxs.iter().filter(|&&i| !results[0][i] && results[mi][i]).count();
-                let n10 = idxs.iter().filter(|&&i| results[0][i] && !results[mi][i]).count();
+                let n01 = idxs
+                    .iter()
+                    .filter(|&&i| !results[0][i] && results[mi][i])
+                    .count();
+                let n10 = idxs
+                    .iter()
+                    .filter(|&&i| results[0][i] && !results[mi][i])
+                    .count();
                 let p = mcnemar_p(n01, n10);
                 format!(
                     "{:.0}% (p={:.3})",

@@ -77,7 +77,11 @@ impl EnricherSpec {
             );
             return Ok(());
         }
-        anyhow::ensure!(self.rank < hidden, "rank {} must be < hidden {hidden}", self.rank);
+        anyhow::ensure!(
+            self.rank < hidden,
+            "rank {} must be < hidden {hidden}",
+            self.rank
+        );
         Ok(())
     }
 
@@ -220,12 +224,7 @@ fn spec_from_cfg(t: &Tensor) -> CResult<EnricherSpec> {
 }
 
 impl Enricher {
-    pub fn new(
-        hidden: usize,
-        gate_bias: f64,
-        spec: EnricherSpec,
-        seed: u64,
-    ) -> CResult<Self> {
+    pub fn new(hidden: usize, gate_bias: f64, spec: EnricherSpec, seed: u64) -> CResult<Self> {
         spec.validate(hidden).map_err(candle::Error::msg)?;
         let mut varmap = candle_nn::VarMap::new();
         let gate_w = varmap.get(
@@ -419,7 +418,11 @@ impl Enricher {
         names.sort(); // deterministic order
         names
             .into_iter()
-            .map(|n| data.get(&n).unwrap_or_else(|| panic!("{n} missing from varmap")).clone())
+            .map(|n| {
+                data.get(&n)
+                    .unwrap_or_else(|| panic!("{n} missing from varmap"))
+                    .clone()
+            })
             .collect()
     }
 
@@ -533,10 +536,7 @@ impl Enricher {
             return Ok((q, zero.clone(), zero));
         };
         let sh = s.to_dtype(DType::F32)?.broadcast_div(
-            &((s.to_dtype(DType::F32)?
-                .sqr()?
-                .sum_keepdim(D::Minus1)?
-                / self.hidden as f64)?
+            &((s.to_dtype(DType::F32)?.sqr()?.sum_keepdim(D::Minus1)? / self.hidden as f64)?
                 + 1e-6)?
                 .sqrt()?,
         )?; // [B, H], ||shat|| = sqrt(H)
@@ -608,19 +608,21 @@ impl Enricher {
             .set(self.gate_sum.get() + gate.sum_all()?.to_scalar::<f32>()? as f64);
         self.gate_n.set(self.gate_n.get() + gate.dim(0)?);
         let applied = applied_pre.broadcast_mul(&gate)?; // [B, H]
-        let preg = inj_pre.sqr()?.sum_keepdim(D::Minus1)?.broadcast_div(&q_sq)?; // [B, 1]
-        let appl = applied.sqr()?.sum_keepdim(D::Minus1)?.broadcast_div(&q_sq)?; // [B, 1]
+        let preg = inj_pre
+            .sqr()?
+            .sum_keepdim(D::Minus1)?
+            .broadcast_div(&q_sq)?; // [B, 1]
+        let appl = applied
+            .sqr()?
+            .sum_keepdim(D::Minus1)?
+            .broadcast_div(&q_sq)?; // [B, 1]
         let x = q.broadcast_add(&applied)?; // [B, H]
         Ok((x, preg, appl))
     }
 
     /// Single-row convenience wrapper ([hidden] in, [hidden] x out, pre-gate
     /// relative injection energy as a scalar).
-    pub fn enrich_1d(
-        &self,
-        e: &Tensor,
-        prev_state: Option<&Tensor>,
-    ) -> CResult<(Tensor, f64)> {
+    pub fn enrich_1d(&self, e: &Tensor, prev_state: Option<&Tensor>) -> CResult<(Tensor, f64)> {
         let e2 = e.reshape((1, e.dims1()?))?;
         let s2 = match prev_state {
             Some(s) => Some(s.reshape((1, s.dims1()?))?),
@@ -676,5 +678,73 @@ impl Enricher {
         self.alpha_n.set(0);
         self.alpha_degen.set(0);
         Some((abs, rem, degen))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_roundtrip_through_cfg_tensor() {
+        let specs = [
+            EnricherSpec::default(),
+            EnricherSpec {
+                rank: 64,
+                gelu: true,
+                content_gate: false,
+                a_mode: AMode::FixedRandom,
+                residual: ResidualMode::None,
+            },
+            EnricherSpec {
+                rank: 128,
+                gelu: false,
+                content_gate: true,
+                a_mode: AMode::Trainable,
+                residual: ResidualMode::Pick,
+            },
+            EnricherSpec {
+                rank: 32,
+                gelu: false,
+                content_gate: false,
+                a_mode: AMode::Pca,
+                residual: ResidualMode::Pick,
+            },
+        ];
+        for spec in specs {
+            let t = cfg_tensor(&spec).unwrap();
+            let back = spec_from_cfg(&t).unwrap();
+            assert_eq!(back, spec);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_rank0_options_and_oversized_rank() {
+        assert!(EnricherSpec::default().validate(640).is_ok());
+        assert!(
+            EnricherSpec {
+                rank: 0,
+                gelu: true,
+                ..Default::default()
+            }
+            .validate(640)
+            .is_err()
+        );
+        assert!(
+            EnricherSpec {
+                rank: 640,
+                ..Default::default()
+            }
+            .validate(640)
+            .is_err()
+        );
+        assert!(
+            EnricherSpec {
+                rank: 64,
+                ..Default::default()
+            }
+            .validate(640)
+            .is_ok()
+        );
     }
 }

@@ -1,13 +1,13 @@
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use candle::quantized::{gguf_file, QMatMul as InnerQMatMul, QTensor};
-use candle::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{kv_cache::KvCache, kv_cache::RotatingKvCache, Activation, Embedding};
+use candle::quantized::{QMatMul as InnerQMatMul, QTensor, gguf_file};
+use candle::{D, DType, Device, Module, Result, Tensor};
+use candle_nn::{Activation, Embedding, kv_cache::KvCache, kv_cache::RotatingKvCache};
 
 use crate::model::{
-    prepare_decoder_attention_mask, repeat_kv, solve_entropy_temperature, Config, FeedbackConfig,
-    FeedbackStats, FeedbackTempMode, KvCacheKind, PrefillStats, ProbeOut, RmsNorm, RotaryEmbedding,
+    Config, FeedbackConfig, FeedbackStats, FeedbackTempMode, KvCacheKind, PrefillStats, ProbeOut,
+    RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask, repeat_kv, solve_entropy_temperature,
 };
 
 struct QMatMul {
@@ -50,7 +50,11 @@ fn norm_from_gguf(t: QTensor, eps: f64, device: &Device) -> Result<RmsNorm> {
     Ok(RmsNorm::from_weight(weight, eps))
 }
 
-fn config_from_gguf(ct: &gguf_file::Content, vocab_size: usize, hidden_size: usize) -> Result<Config> {
+fn config_from_gguf(
+    ct: &gguf_file::Content,
+    vocab_size: usize,
+    hidden_size: usize,
+) -> Result<Config> {
     let key_length = req_u32(ct, "attention.key_length")? as usize;
     Ok(Config {
         attention_bias: false,
@@ -270,11 +274,17 @@ impl QuantizedModel {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
             let p = format!("blk.{layer_idx}");
-            let q_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q.weight"), device)?)?;
-            let k_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k.weight"), device)?)?;
-            let v_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_v.weight"), device)?)?;
-            let o_proj =
-                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_output.weight"), device)?)?;
+            let q_proj =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q.weight"), device)?)?;
+            let k_proj =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k.weight"), device)?)?;
+            let v_proj =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_v.weight"), device)?)?;
+            let o_proj = QMatMul::from_qtensor(ct.tensor(
+                reader,
+                &format!("{p}.attn_output.weight"),
+                device,
+            )?)?;
             let q_norm = norm_from_gguf(
                 ct.tensor(reader, &format!("{p}.attn_q_norm.weight"), device)?,
                 cfg.rms_norm_eps,
@@ -286,15 +296,21 @@ impl QuantizedModel {
                 device,
             )?;
             let mlp = QuantizedMlp {
-                gate_proj: QMatMul::from_qtensor(
-                    ct.tensor(reader, &format!("{p}.ffn_gate.weight"), device)?,
-                )?,
-                up_proj: QMatMul::from_qtensor(
-                    ct.tensor(reader, &format!("{p}.ffn_up.weight"), device)?,
-                )?,
-                down_proj: QMatMul::from_qtensor(
-                    ct.tensor(reader, &format!("{p}.ffn_down.weight"), device)?,
-                )?,
+                gate_proj: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    &format!("{p}.ffn_gate.weight"),
+                    device,
+                )?)?,
+                up_proj: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    &format!("{p}.ffn_up.weight"),
+                    device,
+                )?)?,
+                down_proj: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    &format!("{p}.ffn_down.weight"),
+                    device,
+                )?)?,
                 act_fn: cfg.hidden_activation,
             };
             let input_layernorm = norm_from_gguf(
@@ -513,9 +529,7 @@ impl QuantizedModel {
         let probs = candle_nn::ops::softmax_last_dim(&(logits_f32 / temperature)?)?;
         let (b_sz, seq_len, vocab) = probs.dims3()?;
         let embeddings = self.embeddings_f32.as_ref().unwrap();
-        let xs = probs
-            .reshape((b_sz * seq_len, vocab))?
-            .matmul(embeddings)?;
+        let xs = probs.reshape((b_sz * seq_len, vocab))?.matmul(embeddings)?;
         xs.reshape((b_sz, seq_len, ()))?
             .affine((self.hidden_size as f64).sqrt(), 0.0)
     }
@@ -591,17 +605,12 @@ impl QuantizedModel {
     /// expected embeddings from full-position logits, then one injection
     /// pass over the blended embeddings builds the KV cache the decode loop
     /// continues from. Returns last-position logits and summary stats.
-    pub fn forward_prompt_blend(
-        &mut self,
-        input_ids: &Tensor,
-    ) -> Result<(Tensor, PrefillStats)> {
+    pub fn forward_prompt_blend(&mut self, input_ids: &Tensor) -> Result<(Tensor, PrefillStats)> {
         let (b_size, seq_len) = input_ids.dims2()?;
         const CHUNK: usize = 64;
         let alpha = self.feedback.prefill_blend.clamp(0.0, 1.0);
         if self.feedback.prefill_iters > 1 {
-            candle::bail!(
-                "iterated prefill feedback (cascade) requires the safetensors backend"
-            );
+            candle::bail!("iterated prefill feedback (cascade) requires the safetensors backend");
         }
         let mut expected_chunks: Vec<Tensor> = Vec::new();
         let mut t_sum = 0f64;
@@ -623,8 +632,8 @@ impl QuantizedModel {
             let temperature = self.resolve_temperature(&logits_f32, len)?;
             let probs = candle_nn::ops::softmax_last_dim(&(&logits_f32 / temperature)?)?;
             let logp = (&probs + 1e-12)?.log()?;
-            let chunk_h = -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64)
-                / (b_size * len) as f64;
+            let chunk_h =
+                -((&probs * &logp)?.sum_all()?.to_scalar::<f32>()? as f64) / (b_size * len) as f64;
             t_sum += temperature;
             h_sum += chunk_h * len as f64;
             n_positions += len;
@@ -654,10 +663,22 @@ impl QuantizedModel {
             self.create_attention_masks(b_size, seq_len, 0)?;
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, 0)?;
         let stats = PrefillStats {
-            temperature: if n_positions > 0 { t_sum / (seq_len as f64 / CHUNK as f64).ceil() } else { f64::NAN },
-            entropy: if n_positions > 0 { h_sum / n_positions as f64 } else { f64::NAN },
+            temperature: if n_positions > 0 {
+                t_sum / (seq_len as f64 / CHUNK as f64).ceil()
+            } else {
+                f64::NAN
+            },
+            entropy: if n_positions > 0 {
+                h_sum / n_positions as f64
+            } else {
+                f64::NAN
+            },
             iters: 1,
-            entropies: vec![if n_positions > 0 { h_sum / n_positions as f64 } else { f64::NAN }],
+            entropies: vec![if n_positions > 0 {
+                h_sum / n_positions as f64
+            } else {
+                f64::NAN
+            }],
         };
         let last = xs.narrow(1, seq_len - 1, 1)?;
         let logits = self.finish(last.clone())?;
@@ -709,7 +730,12 @@ impl QuantizedModel {
         };
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(1, 1, seqlen_offset)?;
-        let xs = self.run_layers(input, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
+        let xs = self.run_layers(
+            input,
+            &attention_mask,
+            &sliding_attention_mask,
+            seqlen_offset,
+        )?;
         let last = xs.narrow(1, 0, 1)?;
         let out = self.finish(last.clone())?;
         if let Some(enr) = &mut self.enricher {
@@ -745,7 +771,11 @@ impl QuantizedModel {
         let logits = logits.squeeze(0)?.squeeze(0)?.to_vec1::<f32>()?;
         let mut order: Vec<usize> = (0..logits.len()).collect();
         order.sort_by(|&i, &j| logits[j].total_cmp(&logits[i]));
-        let top5 = order.iter().take(5).map(|&i| (i as u32, logits[i])).collect();
+        let top5 = order
+            .iter()
+            .take(5)
+            .map(|&i| (i as u32, logits[i]))
+            .collect();
         Ok(((row_v[..5].to_vec(), norm), top5))
     }
 }
