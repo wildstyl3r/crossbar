@@ -531,11 +531,31 @@ baseline EM calibrated into the 30-80% band:
 - `state-track`: 3 nonsense agents x nonsense objects; chain-of-custody
   statements with a distractor; answer = one holder name (1-2 tokens).
   Probes explicit state carrying through the recurrence.
-- `induce-d`: the bench induce task + 2-3 distractor statements; known 60%
-  baseline band and known feedback sensitivity (Findings 6-7).
+- `induce-d`: 6 in-context nonsense-word -> number mappings + 2-3
+  distractor statements; statements are SHUFFLED, so the queried
+  (last-drawn) pair sits at a random position and the "copy the last
+  stated number" shortcut fails; known 60% baseline band and known
+  feedback sensitivity (Findings 6-7).
 
-4k train + 200 held-out per task; bench induce/digits/trivia remain
-transfer measures (no task overlap).
+4k train + 200 held-out per task. Held-out prompts are deduplicated
+against train (and within held-out; redraw on collision): the plain
+sequential split left ~3% of held-out state-track prompts as literal
+training prompts (the distinct-prompt space is only ~1e5 for state-track;
+induce-d was already collision-free).
+
+Bench relation (corrected 2026-10-08): the original bench `induce` is an
+IN-FAMILY validation of the induce-d skill, not an independent transfer
+measure — same statement/query format, 15/16 vocab overlap with the
+training pool, and ~8x coverage of every (word -> number) pair across
+training prompts (unexploitable: the mapping is random per example, so no
+consistent association exists to memorize; the answer always derives from
+the prompt's own context). Moreover its statements are NOT shuffled, so
+the queried pair is always the last stated one — solvable by echoing the
+last number with zero word->number binding (verified 400/400 rows in
+bench_results.csv; see the bench-validity note in FEEDBACK.md). The
+binding-honest bench variants are `induce-sh` (statements shuffled) and
+`induce-early` (query drawn from positions 0..4, never last-drawn;
+statements shuffled). digits/trivia remain clean transfer measures.
 
 ## Compute reality and execution plan
 

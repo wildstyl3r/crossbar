@@ -86,6 +86,13 @@ fn build_examples(n: usize) -> Vec<Example> {
         }
     }
 
+    // The original bench induce task: 5 in-context nonsense-word -> number
+    // pairs, the LAST-DRAWN pair re-queried. Statements are NOT shuffled, so
+    // the queried pair is always the last stated one (verified 400/400 in
+    // bench_results.csv) — solvable by "echo the last number" without any
+    // word->number binding. Kept unchanged for comparability with the
+    // Finding 6/7/8 numbers; induce-sh / induce-early below are the
+    // binding-honest variants.
     const NONSENSE: &[&str] = &[
         "dax", "wug", "blicket", "zorpie", "toma", "rugg", "fep", "kiki", "gorb", "pil", "nad",
         "mell", "lorp", "seng", "tob", "cootie",
@@ -105,6 +112,66 @@ fn build_examples(n: usize) -> Vec<Example> {
         let answer = numbers[4];
         examples.push(Example {
             task: "induce",
+            id,
+            prompt: format!(
+                "{}.\nQuestion: {query} is?\nAnswer with only the number.",
+                statements.join(". ")
+            ),
+            target: Target::Num(answer),
+            max_tokens: 8,
+        });
+    }
+
+    // induce-sh: same 5-pair task, statements shuffled like the training
+    // induce-d generator — the queried (last-drawn) pair lands at a random
+    // position, so the "copy the last stated number" shortcut fails.
+    let mut rng = StdRng::seed_from_u64(4100);
+    for id in 0..n {
+        let mut pool = NONSENSE.to_vec();
+        shuffle(&mut pool, &mut rng);
+        let chosen: Vec<&str> = pool[..5].to_vec();
+        let numbers: Vec<i64> = (0..5).map(|_| rng.random_range(1..100)).collect();
+        let mut statements: Vec<String> = chosen
+            .iter()
+            .zip(&numbers)
+            .map(|(w, n)| format!("{w} is {n}"))
+            .collect();
+        shuffle(&mut statements, &mut rng);
+        let query = chosen[4];
+        let answer = numbers[4];
+        examples.push(Example {
+            task: "induce-sh",
+            id,
+            prompt: format!(
+                "{}.\nQuestion: {query} is?\nAnswer with only the number.",
+                statements.join(". ")
+            ),
+            target: Target::Num(answer),
+            max_tokens: 8,
+        });
+    }
+
+    // induce-early: the queried pair is drawn from positions 0..4 (never the
+    // last-drawn one) and statements are shuffled — the answer requires
+    // binding the query word to its stated number anywhere in the context;
+    // last-number copying is correct only by chance (1/5).
+    let mut rng = StdRng::seed_from_u64(4200);
+    for id in 0..n {
+        let mut pool = NONSENSE.to_vec();
+        shuffle(&mut pool, &mut rng);
+        let chosen: Vec<&str> = pool[..5].to_vec();
+        let numbers: Vec<i64> = (0..5).map(|_| rng.random_range(1..100)).collect();
+        let mut statements: Vec<String> = chosen
+            .iter()
+            .zip(&numbers)
+            .map(|(w, n)| format!("{w} is {n}"))
+            .collect();
+        shuffle(&mut statements, &mut rng);
+        let k = rng.random_range(0..4usize);
+        let query = chosen[k];
+        let answer = numbers[k];
+        examples.push(Example {
+            task: "induce-early",
             id,
             prompt: format!(
                 "{}.\nQuestion: {query} is?\nAnswer with only the number.",

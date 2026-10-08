@@ -396,6 +396,51 @@ cargo run --release -- --cpu --bench --bench-n 100 --bench-tasks induce,trivia \
     --bench-modes baseline,cascade-k2-a25 --bench-out logs/cascade_confirm_induce.csv
 ```
 
+## Bench validity note (2026-10-08): `induce` queries are always the last-stated pair
+
+Auditing the bench for train/eval leakage surfaced a task-design issue that
+reinterprets Finding 6's induce column:
+
+- **The original bench `induce` never shuffles its statements** (bench.rs
+  `build_examples`): 5 pairs are drawn in order and `query = chosen[4]`,
+  so the queried pair is always the LAST stated one. Verified empirically:
+  **400/400 induce rows in `bench_results.csv`** have the queried word as
+  the final "X is N" statement before the question.
+- **Consequence**: the task is solvable by "echo the last stated number"
+  with zero word->number binding. The Finding 6 damage signature
+  ("68" -> "6", "14" -> "1") is a generation truncation of the *correct*
+  value — consistent with last-number copying as much as with
+  induction-head lookup. The 60% -> 43-47% feedback damage should be read
+  partly as degraded positional-copy precision, not purely as in-context
+  induction damage.
+- **In-family, not transfer**: bench `induce` also shares the statement
+  and question format, the number range, and 15/16 vocabulary words with
+  the enricher training task induce-d, and training prompts cover every
+  (word -> number) pair ~8x (12k pair-instances over 15 x 99 = 1,485
+  combos). This is unexploitable — the mapping is random per example, so
+  no consistent association exists to memorize, and the answer always
+  derives from the prompt's own context — but it means bench induce
+  measures the same skill family the enricher trains on, not an
+  independent capability. digits/trivia are unaffected (no training
+  counterpart).
+
+Remediation (in bench.rs, old task kept for comparability with Findings
+6-8):
+
+- `induce-sh`: same 5-pair task with statements shuffled (mirrors the
+  induce-d generator) — the queried pair lands at a random position and
+  the last-number shortcut fails.
+- `induce-early`: the queried pair is drawn from positions 0..4 (never
+  last-drawn) with shuffled statements — the answer requires binding the
+  query word to its stated number anywhere in context; last-number
+  copying is correct only by chance (~1/5).
+
+For enricher verdicts, cite `induce-sh` / `induce-early`; treat the
+original `induce` as a copy-precision + in-family diagnostic.
+
+Reproduce: `cargo run --release -- --cpu --bench --bench-n 100
+--bench-tasks induce,induce-sh,induce-early --bench-modes baseline`
+
 ## Example commands
 
 ```sh

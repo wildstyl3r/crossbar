@@ -40,7 +40,8 @@ struct Args {
     bench_out: String,
 
     /// Comma-separated task filter for --bench (digits-5, digits-10,
-    /// digits-20, induce, trivia); default runs all tasks.
+    /// digits-20, induce, induce-sh, induce-early, trivia); default runs all
+    /// tasks.
     #[arg(long)]
     bench_tasks: Option<String>,
 

@@ -155,10 +155,33 @@ fn build_dataset() -> (Vec<Example>, Vec<Example>) {
         train.push(build_state_track(&mut rng));
         train.push(build_induce_d(&mut rng));
     }
+    // Held-out hygiene: the generators are small-combinatorial-space tasks
+    // (state-track's distinct-prompt space is ~1e5, with 4k train draws), so
+    // a plain sequential split leaves ~3% of held-out state-track prompts as
+    // literal training prompts. Redraw any held-out example whose prompt
+    // string duplicates a training example (or an earlier held-out one).
+    let mut seen: std::collections::HashSet<String> =
+        train.iter().map(|e| e.prompt.clone()).collect();
     let mut heldout = Vec::new();
+    let mut n_replaced = 0usize;
     for _ in 0..HELDOUT_PAIRS {
-        heldout.push(build_state_track(&mut rng));
-        heldout.push(build_induce_d(&mut rng));
+        let mut st = build_state_track(&mut rng);
+        while seen.contains(&st.prompt) {
+            n_replaced += 1;
+            st = build_state_track(&mut rng);
+        }
+        seen.insert(st.prompt.clone());
+        heldout.push(st);
+        let mut id = build_induce_d(&mut rng);
+        while seen.contains(&id.prompt) {
+            n_replaced += 1;
+            id = build_induce_d(&mut rng);
+        }
+        seen.insert(id.prompt.clone());
+        heldout.push(id);
+    }
+    if n_replaced > 0 {
+        eprintln!("dataset: redrew {n_replaced} held-out prompts that duplicated training examples");
     }
     (train, heldout)
 }
