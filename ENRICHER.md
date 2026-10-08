@@ -214,6 +214,50 @@ cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
     --train-out enricher_v21_r64.safetensors
 ```
 
+### d-sweep smoke (2026-10-08): healthy mechanics, d-dependent injection growth
+
+V2 (`--train-enrich-act gelu`) at the v2-1 recipe (tau=4 exact, batch 4 x
+accum 1, 30+30 micros = 60 effective steps, lr ramp 10, lambda 0.1), seeds
+42 / 31337, held-out probe after training (forced-token cascade CE; the
+v2-1 V0 reference on the same protocol: pregate 0.245, applied 0.23/0.35,
+ce 5.14):
+
+| d | seed | pregate | applied p/ans | probe CE | st20 \|g\| |
+|---|------|---------|---------------|----------|------|
+| 32 | 42 | 0.396 | 0.39/0.53 | 6.72 | 10.5 |
+| 32 | 31337 | 0.469 | 0.46/0.55 | 7.26 | 16.2 |
+| 64 | 42 | **1.292** | 1.26/1.72 | 9.94 | 18.7 |
+| 64 | 31337 | **0.850** | 0.83/1.05 | 5.41 | 24.8 |
+| 128 | 42 | **1.543** | 1.49/1.95 | 4.87 | 19.9 |
+| 128 | 31337 | **1.436** | 1.41/1.68 | 5.40 | 18.5 |
+
+Findings:
+
+1. **Injection growth rate scales with d, reproducibly**: probe pregate
+   0.40-0.47 (d32) < 0.85-1.29 (d64) < 1.44-1.54 (d128); V0 grew slowest
+   of all (0.245) despite the largest init gradient (16.4 vs 3.2 for d64's
+   B). The bottleneck converts gradient into injection *faster* — fewer,
+   better-aligned directions compose under Adam sooner.
+2. **The tax calibration is d-dependent**: lambda 0.1 was tuned on V0's
+   growth rate and under-brakes d >= 64, which exits the 0.25-1x band
+   within 60 steps in both seeds. No aborts fired (the band check is
+   monitoring-only); add a lambda 0.2-0.3 recalibration for d >= 64 or an
+   explicit pregate-band warning/abort in the training loop.
+3. **60-step probe CE cannot rank capacity**: means 6.99 / 7.68 / 5.14
+   (d32/d64/d128), non-monotone with huge seed spread (d64: 9.94 vs
+   5.41). Gradient noise (<= 32 loss tokens) dominates at this horizon.
+   d128-s42 even beat the fresh baseline CE (5.09) — but at 1.5-1.9x
+   applied injection, the regime where TF-CE gains flatter over-injection
+   and need free-running EM to confirm (the M1 lesson).
+4. **Mechanics held everywhere**: gate 0.99 flat, no collapse, no abort,
+   RSS ~5 GB (batch 4, tau=4), ~9.5 min per run + ~1 min probe.
+
+Next-run consequences: overnight capacity runs (600+1800, tau=6 exact,
+batch 4 x accum 4) should use d=32 lambda=0.1 as-is, and d=64/128 only
+after a 10-min lambda=0.3 calibration smoke confirms pregate <= 1x at 60
+steps. Free-running EM + bench transfer, not probe CE, are the verdict
+metrics.
+
 ## Training as RNN BPTT
 
 Training == inference semantics: a **lockstep batch cascade** over
