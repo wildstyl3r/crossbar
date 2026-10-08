@@ -731,6 +731,7 @@ pub fn run(
     };
     tau_sweep(engine, &enr, &batches[0], &grid, cfg.inj_l2)?;
     let _ = enr.take_gate_mean();
+    let _ = enr.take_residual_stats();
 
     enr.set_gate_floor(cfg.gate_floor);
     println!(
@@ -777,8 +778,16 @@ pub fn run(
         if wi % 10 == 0 {
             let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
             let um = enr.take_content_gate_mean().unwrap_or(f64::NAN);
+            let (am, rm, dg) = enr
+                .take_residual_stats()
+                .unwrap_or((f64::NAN, f64::NAN, 0));
+            let dg_s = if dg > 0 {
+                format!(" [degen {dg}]")
+            } else {
+                String::new()
+            };
             println!(
-                "  warmup {wi:>4}: loss {:.4} (lr {:.2e}, gate {:.3}, u {:.3}, pregate {:.3}, |g| {:.3}) [{:.0}s, rss {:.0} MiB]",
+                "  warmup {wi:>4}: loss {:.4} (lr {:.2e}, gate {:.3}, u {:.3}, alpha {am:.3}, rem {rm:.3}{dg_s}, pregate {:.3}, |g| {:.3}) [{:.0}s, rss {:.0} MiB]",
                 loss_sum / loss_n.max(1) as f64,
                 lr,
                 gm,
@@ -853,8 +862,16 @@ pub fn run(
         if si % 10 == 0 {
             let gm = enr.take_gate_mean().unwrap_or(f64::NAN);
             let um = enr.take_content_gate_mean().unwrap_or(f64::NAN);
+            let (am, rm, dg) = enr
+                .take_residual_stats()
+                .unwrap_or((f64::NAN, f64::NAN, 0));
+            let dg_s = if dg > 0 {
+                format!(" [degen {dg}]")
+            } else {
+                String::new()
+            };
             println!(
-                "  st {si:>4}: loss {:.4} (lr {:.2e}, gt {gt:.2}, forced {forced_prob:.2}, gate {:.3}, u {:.3}, pregate {:.3}, appl p/ans {:.3}/{:.3}, |g| {:.3}) [{:.0}s]",
+                "  st {si:>4}: loss {:.4} (lr {:.2e}, gt {gt:.2}, forced {forced_prob:.2}, gate {:.3}, u {:.3}, alpha {am:.3}, rem {rm:.3}{dg_s}, pregate {:.3}, appl p/ans {:.3}/{:.3}, |g| {:.3}) [{:.0}s]",
                 loss_sum / loss_n.max(1) as f64,
                 lr,
                 gm,
@@ -1085,8 +1102,11 @@ pub fn run_probe(
     }
     let n = n_batches as f64;
     let gate = enr.take_gate_mean();
+    let (am, rm, dg) = enr
+        .take_residual_stats()
+        .unwrap_or((f64::NAN, f64::NAN, 0));
     println!(
-        "probe: gate {:?} | pregate rel {:.3} | applied rel prompt {:.3} / answer {:.3} | ce {:.3}",
+        "probe: gate {:?} | pregate rel {:.3} | applied rel prompt {:.3} / answer {:.3} | alpha {am:.3} rem {rm:.3} degen {dg} | ce {:.3}",
         gate,
         preg_sum / n,
         appl_p_sum / n,

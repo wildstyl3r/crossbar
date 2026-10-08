@@ -286,6 +286,239 @@ Findings:
    d >= 64**; d=32 stays at lambda 0.1 (its lambda-0.1 dynamics were
    already in band; lambda 1.0 untested at d32).
 
+## Claim R — the thought-residual (2026-10-08): pick-orthogonal readout source
+
+Question: would the readout benefit from seeing not the previous state `h`
+but `h − s·e`, where `e` is the fed token's embedding and `s` is computed
+naturally from `h`, `e` and the embedding table — so the enricher reads the
+*difference* between the state and the token that survived sampling: the
+thrown-away mixture minus its picked share ("thought-residual").
+
+### The scale is forced, not chosen
+
+The only scale making the subtraction an orthogonal decomposition is the
+projection coefficient
+
+```
+alpha = <h, e> / ||e||^2        h' = h − alpha·e = (I − êê^T) h = P⊥ h
+```
+
+- **Normalization-invariant**: scaling `e` by `c` divides `alpha` by `c`;
+  the residual vector is identical. The embedding table enters only through
+  the row lookup already in hand (`e = q_t = E[a_t]·sqrt(H)`); no
+  table-global normalization is needed or useful (row-norm spread is
+  absorbed exactly).
+- **Interpretable**: on-manifold (`||q|| = ||shat|| = sqrt(640)`), alpha ~=
+  cos(state, pick) in [−1, 1] (Cauchy–Schwarz; no clamping needed). It is
+  the same aligned inner product the tied head evaluates for the logit
+  (`logit(a_t) = <γ∘finalnorm(s), E_row>`), measured in the readout's own
+  pre-final-norm geometry — the model's own confidence in the pick, by
+  construction.
+- **Degenerate tail**: `||h'||^2 = ||h||^2 (1 − alpha^2)`; as alpha^2 → 1
+  the residual → 0 and the existing rmsnorm epsilon (`+1e-6`) turns it into
+  a ~zero readout source ("nothing left to read") without division blowup
+  (amplification stays < sqrt(H) even at alpha^2 = 1 − 1e-7). Near-degenerate
+  rows (alpha^2 > 0.9999) are counted in the logs; hits are a collapse
+  signature for free.
+
+Rejected scales: norm-matched (`||h||/||e||`) subtracts a full token-sized
+chunk regardless of alignment — content-free energy at cos ≈ 0, *added*
+energy at cos < 0 (the magnitude-without-content failure mode, M1 lesson).
+`e = E^T p` (expected mixture) is a valid sibling but costs a 262k×640
+matvec per step (~335 MFLOPs ≈ doubles the head cost) unless top-k
+truncated (~trivial at k=16).
+
+### What it is mechanically: a conditioning change, not a bottleneck
+
+- The residualization removes **exactly one direction** (the pick's): 1 of
+  640 dims, cos^2 of the energy. The low-dim hypothesis (the d-bottleneck
+  phi) is untouched — what changes is *what the bottleneck summarizes*:
+  belief-minus-pick instead of raw belief. This is the doc's motivating
+  concept made operational: "only a single discrete token id survives at
+  the sampling step" — the readout now reads exactly what did not survive
+  it.
+- **The module cannot learn it itself**: A is static, the pick direction
+  varies per step, and at teacher-forced training the pick is the *target*
+  (unrecoverable from the state). Per-step dynamic orthogonalization is a
+  genuine capacity addition, not a reparam of W.
+- The copy-the-pick shortcut (run-5b, Finding 6) is removed from the
+  *source*: the readout no longer must learn to ignore the pick.
+- Confidence-adaptive by construction (Finding 7's "strength must be
+  per-step" satisfied by the pick's own geometry): alpha ≈ 0 at flat steps
+  (the variant *contains* the baseline exactly where it does not matter);
+  at confident steps the source shrinks by cos^2.
+- ICL-safe choice of `e`: subtracting the *current* pick q_t leaves the
+  previous token's residual-stream persistence chunk intact (the copy
+  handle the induction machinery reads). Subtracting q_{t-1} instead (the
+  `prev` sibling) removes the identity-carryover chunk — different
+  semantics: "state beyond what was just processed" vs "state beyond what
+  was just predicted".
+
+### Gradient geometry and credit paths
+
+- P⊥ is symmetric, idempotent, ||P⊥|| = 1: the backward through the
+  residualization multiplies the source gradient by P⊥ — norm-non-expanding;
+  the contraction analysis (c^8 <= 4e-3) and the tau recipe are unchanged.
+- `e` stays a detached leaf (the detached-lookup design is untouched): no
+  new embedding-table gradients.
+- P⊥ acts **only on the readout-recurrence credit path** (dL/dshat through
+  the readout at step t). The immediate path (loss_t → s_t → x_t) and the
+  KV path (loss_>t → KV_t → x_t) — the two dominant credit routes at init
+  (tau-sweep) — are untouched.
+- Central falsifiable consequence: the chain's value function loses
+  pick-alignment shaping. s_{t-1} reaches step t only through the readout,
+  so chain credit to "make the state align with the pick" is exactly zero.
+  Feature (kills echo-steering) or bug (kills confidence-shaping) — Claim R
+  decides empirically.
+
+### Limits (stated precisely)
+
+- **Source-orthogonality ≠ output-orthogonality**: B can still rotate
+  complement content toward the pick direction, and shat_r = P⊥ shat is
+  itself pick-conditional, so a learned echo-through-rotation remains
+  possible (bounded by the tax). The guarantee is on what the module
+  *reads*, not what the model *receives* — which is why residualizing the
+  *injection output* instead is rejected (it would constrain what the model
+  receives; the guards bound energy, never direction).
+- **Training/deploy duality**: alpha uses the fed token — forced at
+  training, sampled at deploy. The same duality q_t already has; no new
+  mismatch class.
+- Precedent: the delta-rule / fast-weight-memory principle — operate on the
+  deviation from the current key, not the raw state — applied on the read
+  side; the associative-memory cue-vs-recall decomposition.
+
+### Variant v2.2: config, monitors, regression
+
+```
+residual none (default): readout source = shat                  (v2.1 unchanged)
+residual pick:           shat_r = rmsnorm(shat − alpha·q_t);    the thought-residual
+                         readout reads shat_r; gate keeps the raw [q; shat] view
+```
+
+- Parameter-free: +2 dots + 1 rms per step (~2k FLOPs vs ~540 MFLOPs for
+  the frozen model). `enrich.cfg` gains a 5th slot (legacy 4-slot cfgs load
+  as `none`); resume with a mismatched residual mode bails.
+- Gate unchanged (raw-state view) — minimal diff, v2.1 gate semantics
+  preserved; a gate-on-residual micro-variant deferred.
+- The PCA Gram collector collects `sh_r` (A reads what A will read).
+- New log columns: `alpha` (mean |alpha|) and `rem` (mean alpha^2 = removed
+  energy fraction); NaN unless residual pick. Degenerate hits counted.
+- Zero-init property preserved trivially: at W/B = 0 the injection is 0
+  regardless of the readout source (bit-exact baseline regression).
+
+### Claim-R run protocol (matches the lambda-1.0 smoke recipe)
+
+Short smokes identical in shape to the cal10 lambda-1.0 runs (tau=4 exact,
+batch 4 x accum 1, 30+30 micros = 60 effective steps, lr ramp 10, lambda
+1.0; matrix d64 s42, d128 s42) plus the held-out probe; the cal10 runs are
+the paired controls. Fresh-init signature sweep first (both modes). Long-run
+consequences deferred until the smokes read out.
+
+```sh
+# d64 (then d128); ~11 min per run + ~1 min probe, matching cal10
+cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
+    --train-enricher --train-steps-warmup 30 --train-steps-st 30 \
+    --train-lr-warmup 10 --train-tau 4 --train-batch 4 --train-accum 1 \
+    --train-inj-l2 1.0 --train-seed 42 \
+    --train-enrich-rank 64 --train-enrich-act gelu --train-enrich-residual pick \
+    --train-skip-eval --train-out /tmp/opencode/res_d64_s42.safetensors
+
+cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
+    --train-enricher --train-probe \
+    --train-out /tmp/opencode/res_d64_s42.safetensors
+```
+
+### Claim-R smokes (2026-10-08): healthy mechanics, d64-pick carries on both seeds
+
+Verification first (all passed): fresh residual-pick signature b 3.247 vs
+none 3.175 (recorded 3.18) — wakeup intact, a/gate 0.000; fresh-pick
+generation bit-identical to baseline; legacy 4-slot cfg loads (alpha/rem
+NaN); resume mismatch bails; fresh-pick held-out probe ce == fresh-none ce
+(4.274 — the doc's earlier 5.09 predates the held-out dedup redraw).
+alpha stats: mean |alpha| ~ 0.11-0.13, mean removed fraction ~ 2% — stable
+across warmup/ST/probe, both ranks, both seeds (a property of the frozen
+states, weakly affected by the injection). No degenerate hits anywhere.
+
+Full matrix (cal10 recipe ± the residual flag; lambda 1.0; d64/d128 x
+seed 42/31337; probe = held-out forced CE after 60 effective steps, fresh
+baseline 4.274):
+
+| d | seed | none pregate | pick pregate | none CE | pick CE | CE delta |
+|---|------|------|------|------|------|------|
+| 64 | 42 | 0.621 | 0.551 | 5.969 | 4.890 | **−1.08** |
+| 64 | 31337 | 0.546 | 0.395 | 5.206 | 4.820 | **−0.39** |
+| 128 | 42 | 0.586 | 0.384 | 3.319 | 4.168 | +0.85 |
+| 128 | 31337 | 0.382 | 0.416 | 4.327 | 3.414 | −0.91 |
+
+Findings:
+
+1. **Mechanics replicated**: gate 0.98-0.99 flat everywhere, pregate in
+   band, no degen hits, ~10.7 min/run (wall time unchanged — the residual
+   op is free). The residual mildly brakes injection growth (pick pregate
+   <= none pregate in 3 of 4 cells).
+2. **d64-pick carries on both seeds** (−1.08, −0.39; means −0.73): the only
+   cell with a consistent directional signal. Its pick seed spread is also
+   the tightest in the matrix (4.890 vs 4.820 — 0.07 nats vs 0.76-1.01
+   elsewhere; 2 points per cell, weak but notable).
+3. **d128 is a coin flip** (+0.85, −0.91): seed noise dominates the rank at
+   d128; no verdict.
+4. Trained-60-step modules sit at or above the fresh-baseline probe CE
+   (4.274) in most cells — the known TF-CE-flattering-over-injection
+   regime; free-running EM remains the verdict metric.
+
+Verdict: no Claim-R decision at the smoke horizon (probe CE is
+teacher-forced and 60 steps is noise-ruled). The candidate for the
+overnight pair is **d64, pick vs none** — it is the cell whose effect
+survived seed replication. d128 drops (inconclusive + 2x probe CE seed
+spread); only its residual mode is carried, as an exploratory cell.
+
+### Claim-R overnight configs (documented 2026-10-08, NOT yet run)
+
+Three runs, the doc's overnight recipe (tau=6 exact KV, batch 4 x accum 4,
+600 + 1800 micros = 600 effective steps ~ 8 h each, lr ramp 50 default,
+lambda 1.0 per the factored-variant calibration verdict), explicit seeds;
+second-seed replication = the same command with `--train-seed 42`. Night
+watch list unchanged (gate < 0.05 abort, pregate > 1, applied p/ans
+divergence, RSS ~4-5 GB) plus the new columns: alpha should stay ~0.11-0.13
+(rem ~2%) — a drift there is a state-distribution warning, not a module
+failure; degen > 0 = collapse signature.
+
+```sh
+# 1. d64 control (none) — doubles as the never-run v2.1 d64 overnight,
+#    pinned to lambda 1.0 (the v2.1 suggestion predated the calibration
+#    verdict and carried the under-braked default 0.1)
+cargo run --release -- --cpu --train-enricher \
+    --model-dir models/gemma-3-270m-it \
+    --train-steps-warmup 600 --train-steps-st 1800 \
+    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
+    --train-inj-l2 1.0 --train-seed 31337 \
+    --train-enrich-rank 64 --train-enrich-act gelu \
+    --train-out enricher_r_d64_none.safetensors
+
+# 2. d64 pick (the Claim-R candidate)
+cargo run --release -- --cpu --train-enricher \
+    --model-dir models/gemma-3-270m-it \
+    --train-steps-warmup 600 --train-steps-st 1800 \
+    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
+    --train-inj-l2 1.0 --train-seed 31337 \
+    --train-enrich-rank 64 --train-enrich-act gelu --train-enrich-residual pick \
+    --train-out enricher_r_d64_pick.safetensors
+
+# 3. d128 pick (exploratory; d128-none dropped — seed sign-flip in the smokes)
+cargo run --release -- --cpu --train-enricher \
+    --model-dir models/gemma-3-270m-it \
+    --train-steps-warmup 600 --train-steps-st 1800 \
+    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
+    --train-inj-l2 1.0 --train-seed 31337 \
+    --train-enrich-rank 128 --train-enrich-act gelu --train-enrich-residual pick \
+    --train-out enricher_r_d128_pick.safetensors
+```
+
+Verdict metrics after the overnights: the standard battery (held-out EM,
+free-running greedy EM + guided-first, digits/trivia bench transfer) —
+free-running EM, not probe CE, decides Claim R; findings then land in
+FEEDBACK.md.
+
 ## Training as RNN BPTT
 
 Training == inference semantics: a **lockstep batch cascade** over

@@ -19,6 +19,18 @@ pub enum AMode {
     Pca,
 }
 
+/// The readout-source treatment (ENRICHER.md, Claim R "thought-residual").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualMode {
+    /// The v2.1 readout: A reads the raw RMS-normalized state.
+    None,
+    /// Pick-orthogonal source: `shat_r = rmsnorm(shat − alpha·q_t)` with
+    /// `alpha = <shat, q_t>/||q_t||²` (the projection coefficient — on-manifold
+    /// ~cos(state, pick)). The readout reads what did not survive sampling;
+    /// the gate keeps its raw-state view. Parameter-free.
+    Pick,
+}
+
 /// Enricher variant specification (ENRICHER.md, "Enricher variants v2.1").
 ///
 /// - `rank == 0`: the v2 full-rank gated readout, `inj = W shat`, W in
@@ -32,12 +44,16 @@ pub enum AMode {
 ///   `u = sigmoid(q W_u + u_z * z + b_u)` in (0,1)^d with W_u in R^{d x H},
 ///   u_z in R^d, and `inj = g * B(u * z)`. The injection penalty stays on the
 ///   PRE-u path `B z`, so the content gate cannot dodge it (M1 lesson a).
+/// - `residual`: the readout-source treatment (Claim R): `Pick` feeds the
+///   pick-orthogonalized state to the readout (and to the PCA collector);
+///   the gate still sees the raw state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnricherSpec {
     pub rank: usize,
     pub gelu: bool,
     pub content_gate: bool,
     pub a_mode: AMode,
+    pub residual: ResidualMode,
 }
 
 impl Default for EnricherSpec {
@@ -47,6 +63,7 @@ impl Default for EnricherSpec {
             gelu: false,
             content_gate: false,
             a_mode: AMode::Trainable,
+            residual: ResidualMode::None,
         }
     }
 }
@@ -69,11 +86,12 @@ impl EnricherSpec {
             return format!("v0 full-rank W ({}x{})", 640, 640);
         }
         format!(
-            "factored rank={} phi={} content-gate={} a={:?}",
+            "factored rank={} phi={} content-gate={} a={:?} residual={:?}",
             self.rank,
             if self.gelu { "gelu" } else { "id" },
             self.content_gate,
-            self.a_mode
+            self.a_mode,
+            self.residual
         )
     }
 }
@@ -115,6 +133,13 @@ pub struct Enricher {
     /// Content-gate (u) mean accumulator for monitoring (V3 only).
     u_sum: std::cell::Cell<f64>,
     u_n: std::cell::Cell<usize>,
+    /// Residual-mode monitors (Claim R): mean |alpha| and mean alpha^2
+    /// (the removed energy fraction), plus near-degenerate rows
+    /// (alpha^2 > 0.9999). All zero unless `residual == Pick`.
+    alpha_abs_sum: std::cell::Cell<f64>,
+    alpha_sq_sum: std::cell::Cell<f64>,
+    alpha_n: std::cell::Cell<usize>,
+    alpha_degen: std::cell::Cell<usize>,
     /// Training aid: floor for the scalar gate value (set > 0 during warmup so
     /// a mis-step cannot switch the module off and zero the B/W gradient).
     gate_floor: std::cell::Cell<f64>,
@@ -152,21 +177,27 @@ fn cfg_tensor(spec: &EnricherSpec) -> CResult<Tensor> {
         AMode::FixedRandom => 1.0,
         AMode::Pca => 2.0,
     };
+    let residual = match spec.residual {
+        ResidualMode::None => 0.0f32,
+        ResidualMode::Pick => 1.0,
+    };
     Tensor::from_vec(
         vec![
             spec.rank as f32,
             if spec.gelu { 1.0 } else { 0.0 },
             if spec.content_gate { 1.0 } else { 0.0 },
             a_mode,
+            residual,
         ],
-        (4,),
+        (5,),
         &Device::Cpu,
     )
 }
 
 fn spec_from_cfg(t: &Tensor) -> CResult<EnricherSpec> {
     let v = t.to_vec1::<f32>()?;
-    if v.len() != 4 {
+    // len 4: the v2.1 cfg (residual did not exist => None); len 5: v2.2+.
+    if v.len() != 4 && v.len() != 5 {
         candle::bail!("malformed {} tensor (len {})", CFG_NAME, v.len());
     }
     let a_mode = match v[3] as usize {
@@ -174,11 +205,17 @@ fn spec_from_cfg(t: &Tensor) -> CResult<EnricherSpec> {
         2 => AMode::Pca,
         _ => AMode::Trainable,
     };
+    let residual = if v.len() == 5 && v[4] > 0.5 {
+        ResidualMode::Pick
+    } else {
+        ResidualMode::None
+    };
     Ok(EnricherSpec {
         rank: v[0] as usize,
         gelu: v[1] > 0.5,
         content_gate: v[2] > 0.5,
         a_mode,
+        residual,
     })
 }
 
@@ -282,6 +319,10 @@ impl Enricher {
             gate_n: std::cell::Cell::new(0),
             u_sum: std::cell::Cell::new(0.0),
             u_n: std::cell::Cell::new(0),
+            alpha_abs_sum: std::cell::Cell::new(0.0),
+            alpha_sq_sum: std::cell::Cell::new(0.0),
+            alpha_n: std::cell::Cell::new(0),
+            alpha_degen: std::cell::Cell::new(0),
             gate_floor: std::cell::Cell::new(0.0),
             collect_shat: std::cell::Cell::new(false),
             gram: std::cell::RefCell::new(None),
@@ -469,7 +510,10 @@ impl Enricher {
     /// The learnable enrichment, batched: `x = q + g * inj` where
     /// `q = e * sqrt(h)`, `shat = s / rms(s)`, and `inj` is
     /// `g * phi_u(W shat)` (v0) or `g * u(?) * B phi(A shat)` (factored
-    /// variants). `e` and `s` are [B, hidden] (raw, unscaled embedding rows
+    /// variants). With `residual == Pick` the readout (and PCA collector)
+    /// sees `shat_r = rmsnorm(shat − alpha·q)` instead — the pick-orthogonal
+    /// thought-residual (Claim R); the gate keeps the raw-state view.
+    /// `e` and `s` are [B, hidden] (raw, unscaled embedding rows
     /// and raw output states; `s = None` on the first step). Returns the
     /// enriched input [B, hidden], the pre-gate relative injection energy
     /// `||inj_pre||^2 / ||q||^2` [B, 1] (the training-time penalty target;
@@ -496,8 +540,46 @@ impl Enricher {
                 + 1e-6)?
                 .sqrt()?,
         )?; // [B, H], ||shat|| = sqrt(H)
+        // Claim R (thought-residual): pick-orthogonal readout source.
+        // alpha = <sh, q>/||q||^2 per row — the projection coefficient of the
+        // state onto the fed token's direction (~cos(state, pick) on-manifold,
+        // i.e. the model's own confidence in the pick, by the head's geometry).
+        // h = sh − alpha·q is the orthogonal complement of the pick direction;
+        // re-RMS-normalized with the same +1e-6 epsilon, so a degenerate
+        // residual (alpha^2 -> 1) becomes a ~zero readout source instead of a
+        // division blowup. The readout and the PCA collector see sh_read; the
+        // gate below keeps the raw-state view.
+        let sh_read = match self.spec.residual {
+            ResidualMode::Pick => {
+                let alpha = sh
+                    .broadcast_mul(&q)?
+                    .sum_keepdim(D::Minus1)? // [B, 1]
+                    .broadcast_div(&q_sq)?; // [B, 1]
+                let av = alpha.flatten_all()?.to_vec1::<f32>()?;
+                let mut abs_sum = 0f64;
+                let mut sq_sum = 0f64;
+                let mut degen = 0usize;
+                for &a in &av {
+                    let a = a as f64;
+                    abs_sum += a.abs();
+                    sq_sum += a * a;
+                    if a * a > 0.9999 {
+                        degen += 1;
+                    }
+                }
+                self.alpha_abs_sum.set(self.alpha_abs_sum.get() + abs_sum);
+                self.alpha_sq_sum.set(self.alpha_sq_sum.get() + sq_sum);
+                self.alpha_n.set(self.alpha_n.get() + av.len());
+                self.alpha_degen.set(self.alpha_degen.get() + degen);
+                let h = sh.broadcast_sub(&alpha.broadcast_mul(&q)?)?; // [B, H]
+                h.broadcast_div(
+                    &((h.sqr()?.sum_keepdim(D::Minus1)? / self.hidden as f64)? + 1e-6)?.sqrt()?,
+                )? // [B, H], ||shat_r|| = sqrt(H)
+            }
+            ResidualMode::None => sh.clone(),
+        };
         if self.collect_shat.get() {
-            let shd = sh.detach();
+            let shd = sh_read.detach();
             let g = shd.t()?.matmul(&shd)?; // [H, H]
             let mut slot = self.gram.borrow_mut();
             match slot.as_ref() {
@@ -509,8 +591,8 @@ impl Enricher {
             }
             self.gram_n.set(self.gram_n.get() + sh.dim(0)?);
         }
-        let (inj_pre, applied_pre) = self.compute_injection(&q, &sh)?;
-        let gate_in = Tensor::cat(&[&q, &sh], D::Minus1)?; // [B, 2H]
+        let (inj_pre, applied_pre) = self.compute_injection(&q, &sh_read)?;
+        let gate_in = Tensor::cat(&[&q, &sh], D::Minus1)?; // [B, 2H] raw-state view
         let gate = candle_nn::ops::sigmoid(
             &gate_in
                 .matmul(&self.gate_w.unsqueeze(1)?)?
@@ -576,5 +658,23 @@ impl Enricher {
         self.u_sum.set(0.0);
         self.u_n.set(0);
         Some(m)
+    }
+
+    /// Residual-mode monitors since the last call (Claim R): (mean |alpha|,
+    /// mean alpha^2 = removed energy fraction, near-degenerate rows). None
+    /// unless `residual == Pick` and at least one enriched step ran.
+    pub fn take_residual_stats(&self) -> Option<(f64, f64, usize)> {
+        let n = self.alpha_n.get();
+        if n == 0 {
+            return None;
+        }
+        let abs = self.alpha_abs_sum.get() / n as f64;
+        let rem = self.alpha_sq_sum.get() / n as f64;
+        let degen = self.alpha_degen.get();
+        self.alpha_abs_sum.set(0.0);
+        self.alpha_sq_sum.set(0.0);
+        self.alpha_n.set(0);
+        self.alpha_degen.set(0);
+        Some((abs, rem, degen))
     }
 }

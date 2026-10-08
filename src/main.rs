@@ -283,6 +283,14 @@ struct Args {
     /// from a PCA of collected states via a no-grad calibration pass.
     #[arg(long, value_enum, default_value = "trainable")]
     train_enrich_a: EnrichAMode,
+
+    /// Readout-source treatment (ENRICHER.md, Claim R): pick = the readout
+    /// sees the pick-orthogonalized state `rmsnorm(shat − alpha·q)` with
+    /// alpha = <shat, q>/||q||² (the thought-residual — the state minus its
+    /// projection onto the fed token's direction); none = the raw state
+    /// (v2.1). Parameter-free; the gate keeps the raw-state view.
+    #[arg(long, value_enum, default_value = "none")]
+    train_enrich_residual: EnrichResidual,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -296,6 +304,12 @@ enum EnrichAMode {
     Trainable,
     Fixed,
     Pca,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum EnrichResidual {
+    None,
+    Pick,
 }
 
 enum Engine {
@@ -572,6 +586,10 @@ fn main() -> Result<()> {
     )?)?;
 
     if args.train_enricher {
+        let residual = match args.train_enrich_residual {
+            EnrichResidual::None => enrich::ResidualMode::None,
+            EnrichResidual::Pick => enrich::ResidualMode::Pick,
+        };
         let spec = enrich::EnricherSpec {
             rank: args.train_enrich_rank,
             gelu: matches!(args.train_enrich_act, EnrichAct::Gelu),
@@ -581,6 +599,7 @@ fn main() -> Result<()> {
                 EnrichAMode::Fixed => enrich::AMode::FixedRandom,
                 EnrichAMode::Pca => enrich::AMode::Pca,
             },
+            residual,
         };
         if let Err(e) = spec.validate(engine.hidden()) {
             anyhow::bail!("invalid enricher spec: {e}");
@@ -627,6 +646,7 @@ fn main() -> Result<()> {
                         EnrichAMode::Fixed => enrich::AMode::FixedRandom,
                         EnrichAMode::Pca => enrich::AMode::Pca,
                     },
+                    residual,
                 },
             },
         )?;
