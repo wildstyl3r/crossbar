@@ -258,6 +258,34 @@ after a 10-min lambda=0.3 calibration smoke confirms pregate <= 1x at 60
 steps. Free-running EM + bench transfer, not probe CE, are the verdict
 metrics.
 
+### Lambda calibration smokes (2026-10-08): lambda 1.0 is the factored-variant brake
+
+Same recipe, `--train-inj-l2` swept at fixed d (probe = held-out forced
+CE after 60 effective steps; baseline ~5.09):
+
+| d | seed | pregate lam 0.1 | 0.3 | 1.0 | probe CE 0.1 | 0.3 | 1.0 |
+|---|------|------|-----|-----|------|-----|-----|
+| 64 | 42 | 1.292 | 1.301 | **0.621** | 9.94 | 8.19 | 5.97 |
+| 64 | 31337 | 0.850 | 0.707 | — | 5.41 | 5.08 | — |
+| 128 | 42 | 1.543 | 0.967 | **0.586** | 4.87 | 4.68 | **3.32** |
+| 128 | 31337 | 1.436 | 0.816 | — | 5.40 | 4.54 | — |
+
+Findings:
+
+1. **lambda 0.3 barely brakes d64** (1.292 -> 1.301 on s42) — consistent
+   with AdamW's per-entry normalization: when the tax gradient is
+   sub-dominant in magnitude *and* rarely flips an entry's sign balance,
+   scaling it 3x changes little. lambda 1.0 does bite (0.62, in band).
+2. **lambda 1.0 improved CE instead of crushing it**: d128/s42 probe CE
+   3.32 (baseline 5.09), in-train ST loss *declines* through the forcing
+   anneal (st20 4.85 vs 5.81 at lambda 0.1 and 7.3-8.9 for the rest of
+   the matrix). Restrained injection looks better-conditioned, not
+   starved. Caveats stand: probe CE is teacher-forced (~40 rows), 60-step
+   horizon — free-running EM remains the verdict.
+3. Calibration verdict: **lambda = 1.0 for the factored variants at
+   d >= 64**; d=32 stays at lambda 0.1 (its lambda-0.1 dynamics were
+   already in band; lambda 1.0 untested at d32).
+
 ## Training as RNN BPTT
 
 Training == inference semantics: a **lockstep batch cascade** over
