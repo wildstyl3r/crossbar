@@ -8,12 +8,22 @@ use crate::model;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// Run an interactive chat REPL instead of one-shot generation
+    /// (--prompt is ignored).
+    #[arg(long)]
+    pub repl: bool,
+
+    /// Tool calling mode for the REPL: off, auto (parse replies for tool
+    /// calls) or required (retry when a reply is not a tool call).
+    #[arg(long, value_enum, default_value = "off")]
+    pub tools: crate::tools::ToolMode,
+
     /// Run on CPU rather than on GPU.
     #[arg(long)]
     pub cpu: bool,
 
-    /// The prompt to run the generator with (required unless --bench or
-    /// --probe is set).
+    /// The prompt to run the generator with (required unless --bench,
+    /// --probe or --repl is set).
     #[arg(long, short = 'p')]
     pub prompt: Option<String>,
 

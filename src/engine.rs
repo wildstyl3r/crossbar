@@ -122,6 +122,22 @@ impl Engine {
         }
     }
 
+    /// Maximum context window (positions) the backend supports.
+    pub fn max_positions(&self) -> usize {
+        match self {
+            Self::F32(m) => m.max_positions(),
+            Self::Quantized(m) => m.max_positions(),
+        }
+    }
+
+    /// Attention sliding window (0 when every layer is full attention).
+    pub fn sliding_window(&self) -> usize {
+        match self {
+            Self::F32(m) => m.sliding_window(),
+            Self::Quantized(m) => m.sliding_window(),
+        }
+    }
+
     pub fn attach_enricher(&mut self, enr: enrich::Enricher) -> Result<()> {
         match self {
             Self::F32(m) => m.set_enricher(enr),

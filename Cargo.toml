@@ -8,6 +8,7 @@ anyhow = "1"
 candle = { package = "candle-core", git = "https://github.com/huggingface/candle.git", version = "0.11.0" }
 candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.11.0" }
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 minijinja = { version = "2", features = ["serde"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }

@@ -2,6 +2,7 @@ use anyhow::{Context, Error as E, Result};
 use candle::{DType, Device, Tensor};
 use std::collections::HashSet;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokenizers::Tokenizer;
 
 use crate::Engine;
@@ -78,11 +79,86 @@ impl TokenOutputStream {
     }
 }
 
+/// Per-request sampling parameters.
+#[derive(Debug, Clone)]
+pub struct SamplingParams {
+    /// Softmax temperature; `None` means 1.0, `Some(0.0)` is greedy.
+    pub temperature: Option<f64>,
+    /// Top-k sampling; `None` or 0 disables it.
+    pub top_k: Option<usize>,
+    /// Nucleus sampling cutoff; `None` disables it.
+    pub top_p: Option<f64>,
+    /// Penalty applied to tokens in the recent context, 1. means none.
+    pub repeat_penalty: f32,
+    /// Context length for the repeat penalty.
+    pub repeat_last_n: usize,
+    /// RNG seed; `None` picks a fresh random seed per generation.
+    pub seed: Option<u64>,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            seed: None,
+        }
+    }
+}
+
+impl SamplingParams {
+    pub fn greedy() -> Self {
+        Self {
+            temperature: Some(0.0),
+            ..Default::default()
+        }
+    }
+
+    fn processor(&self) -> LogitsProcessor {
+        let seed = self.seed.unwrap_or_else(rand::random::<u64>);
+        LogitsProcessor::new(seed, self.temperature, self.top_k, self.top_p)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    /// An EOS / `<end_of_turn>` token was sampled.
+    Eos,
+    /// The token budget was exhausted.
+    MaxTokens,
+    /// A stop string was about to be produced (the outcome text is
+    /// truncated before it).
+    Stopped(String),
+    /// The cancel flag was set between decode steps.
+    Cancelled,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eos => write!(f, "stop"),
+            Self::MaxTokens => write!(f, "length"),
+            Self::Stopped(s) => write!(f, "stop-string {s:?}"),
+            Self::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
 pub struct GenerationOutcome {
-    /// Full generated text (special tokens skipped).
+    /// Full generated text (special tokens skipped, stop strings removed).
     pub text: String,
     /// Number of generated tokens (including a trailing EOS).
     pub tokens: usize,
+    /// Why generation stopped.
+    pub reason: StopReason,
+    /// Token ids present in the KV cache when generation ended: the ids
+    /// forwarded by this and any reused prefix. Passing them as
+    /// `GenerateOptions::cached_prefix` on a prompt that starts with them
+    /// skips the re-prefill of that part.
+    pub context_ids: Vec<u32>,
     /// Mean feedback-distribution entropy over the steps that used feedback.
     pub mean_hfb: Option<f64>,
     /// Mean raw-distribution entropy (T=1) over all steps.
@@ -91,6 +167,8 @@ pub struct GenerationOutcome {
 
 pub(crate) struct GenerationTiming {
     pub prompt_len: usize,
+    /// Ids served from the retained KV cache instead of being re-prefilled.
+    pub reused_prefix: usize,
     pub prefill: std::time::Duration,
     pub decode_tokens: usize,
     pub decode_forward: std::time::Duration,
@@ -99,13 +177,75 @@ pub(crate) struct GenerationTiming {
     pub total: std::time::Duration,
 }
 
+/// Logits filter hook (structured output / grammar constraints): `mask`
+/// runs after the repeat penalty and before sampling; `on_token` receives
+/// each sampled token so constrained-decoding state machines can advance.
+pub trait LogitsFilter {
+    fn mask(&mut self, logits: &mut [f32]);
+    fn on_token(&mut self, _token: u32) {}
+}
+
+/// Streaming sink: receives each incrementally decoded chunk (and the
+/// final withheld remainder).
+pub type StreamSink<'a> = Box<dyn FnMut(&str) -> Result<()> + 'a>;
+
+/// Per-generation options beyond the fixed engine setup.
+pub struct GenerateOptions<'a> {
+    /// Sampling parameters (temperature / top-k / top-p / penalties / seed).
+    pub sampling: SamplingParams,
+    /// Maximum number of tokens to generate.
+    pub max_tokens: usize,
+    /// Generation stops (the stopping token is not streamed) when the
+    /// decoded text would contain any of these strings.
+    pub stop_strings: Vec<String>,
+    /// Polled between decode steps; a `true` value stops generation.
+    pub cancel: Option<&'a AtomicBool>,
+    /// Ids already present in the KV cache from a previous generation
+    /// (`GenerationOutcome::context_ids`); when they prefix this prompt,
+    /// that part is not re-prefilled. Ignored for the enricher and
+    /// feedback modes, and on any mismatch (the cache is cleared).
+    pub cached_prefix: Option<Vec<u32>>,
+    /// Optional logits filter (schema-constrained sampling).
+    pub filter: Option<Box<dyn LogitsFilter + 'a>>,
+    /// Streaming sink; `None` runs silently.
+    pub stream: Option<StreamSink<'a>>,
+}
+
+impl Default for GenerateOptions<'_> {
+    fn default() -> Self {
+        Self {
+            sampling: SamplingParams::default(),
+            max_tokens: 256,
+            stop_strings: Vec::new(),
+            cancel: None,
+            cached_prefix: None,
+            filter: None,
+            stream: None,
+        }
+    }
+}
+
+/// Number of leading ids of `full` that match `cached` — the part of the
+/// prompt that can be served from the retained KV cache. 0 when there is
+/// no cached prefix or it does not match.
+fn resume_len(full: &[u32], cached: Option<&[u32]>) -> usize {
+    let Some(cached) = cached else {
+        return 0;
+    };
+    if cached.len() > full.len() {
+        return 0;
+    }
+    if full[..cached.len()] == *cached {
+        cached.len()
+    } else {
+        0
+    }
+}
+
 pub struct TextGeneration {
     model: Engine,
     device: Device,
     tokenizer: TokenOutputStream,
-    logits_processor: LogitsProcessor,
-    repeat_penalty: f32,
-    repeat_last_n: usize,
     eos_tokens: Vec<u32>,
     debug_logits: bool,
     softmax_feedback: bool,
@@ -119,12 +259,6 @@ impl TextGeneration {
     pub fn new(
         model: Engine,
         tokenizer: Tokenizer,
-        seed: u64,
-        temperature: Option<f64>,
-        top_k: Option<usize>,
-        top_p: Option<f64>,
-        repeat_penalty: f32,
-        repeat_last_n: usize,
         eos_tokens: Vec<u32>,
         device: &Device,
         debug_logits: bool,
@@ -132,13 +266,9 @@ impl TextGeneration {
         prefill_feedback: bool,
         diagnostics: bool,
     ) -> Self {
-        let logits_processor = LogitsProcessor::new(seed, temperature, top_k, top_p);
         Self {
             model,
             tokenizer: TokenOutputStream::new(tokenizer),
-            logits_processor,
-            repeat_penalty,
-            repeat_last_n,
             eos_tokens,
             device: device.clone(),
             debug_logits,
@@ -155,28 +285,89 @@ impl TextGeneration {
         self.collect_stats = on;
     }
 
-    /// Generation core. With `stream` the tokens are printed as they are
-    /// produced; otherwise the run is silent and the text is returned.
+    /// Access to the underlying tokenizer (e.g. to build a vocab trie).
+    pub fn tokenizer(&self) -> &Tokenizer {
+        self.tokenizer.tokenizer()
+    }
+
+    /// Maximum context window (positions) of the underlying model.
+    pub fn max_context(&self) -> usize {
+        self.model.max_positions()
+    }
+
+    /// Generation core. With a `stream` sink the tokens are handed to it as
+    /// they are produced; otherwise the run is silent and the text is
+    /// returned in the outcome.
     pub(crate) fn generate(
         &mut self,
         prompt: &str,
-        sample_len: usize,
-        stream: bool,
+        opts: GenerateOptions<'_>,
     ) -> Result<(GenerationOutcome, GenerationTiming)> {
-        self.tokenizer.clear();
-        self.model.clear_kv_cache();
-        let mut tokens = self
+        let tokens = self
             .tokenizer
             .tokenizer()
             .encode(prompt, false)
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+        self.generate_from(tokens, opts)
+    }
+
+    /// Generation core over pre-built prompt ids (used by the REPL to
+    /// assemble append-only prompts from the retained KV-cache prefix).
+    pub(crate) fn generate_from(
+        &mut self,
+        mut tokens: Vec<u32>,
+        mut opts: GenerateOptions<'_>,
+    ) -> Result<(GenerationOutcome, GenerationTiming)> {
+        self.tokenizer.clear();
+        let mut logits_processor = opts.sampling.processor();
 
         let prompt_len = tokens.len();
         let has_enricher = self.model.has_enricher();
-        let mut generated_tokens = 0usize;
+        // KV-cache reuse: keep the cache when the caller's prefix (the ids
+        // forwarded by the previous generation) is a prefix of this prompt
+        // and the model runs the plain path — the feedback and enricher
+        // modes carry cross-position state that does not survive a
+        // partial prefill.
+        let matched = resume_len(&tokens, opts.cached_prefix.as_deref());
+        // A full-length match (no new tokens) would re-forward an already
+        // cached position; treat it as no reuse.
+        let can_reuse = matched > 0
+            && matched < prompt_len
+            && !has_enricher
+            && !self.prefill_feedback
+            && !self.softmax_feedback;
+        let mut base = if can_reuse {
+            matched
+        } else {
+            self.model.clear_kv_cache();
+            0
+        };
+        let mut cache_len = if can_reuse { matched } else { 0 };
+        let mut reused_prefix = 0usize;
+        // A multi-token chunk append pairs correctly with the positional
+        // masks only while the sliding ring has not wrapped (and from an
+        // empty cache, where the >= window case returns the chunk in
+        // positional order); feed the delta token by token otherwise.
+        let chunked = base == 0 || prompt_len <= self.model.sliding_window();
         let mut prefill_total = std::time::Duration::ZERO;
+        if can_reuse && opts.max_tokens > 0 {
+            reused_prefix = base;
+            if !chunked {
+                let t = std::time::Instant::now();
+                for (i, &tok) in tokens[base..prompt_len - 1].iter().enumerate() {
+                    let input = Tensor::new(&[tok], &self.device)?.unsqueeze(0)?;
+                    self.model.forward(&input, base + i)?;
+                    cache_len += 1;
+                }
+                prefill_total += t.elapsed();
+                base = prompt_len - 1;
+            }
+        }
+        let mut generated_tokens = 0usize;
+        let mut reason = StopReason::MaxTokens;
+        let mut recent = String::new();
         let mut decode_tokens = 0usize;
         let mut decode_forward = std::time::Duration::ZERO;
         let mut decode_sample = std::time::Duration::ZERO;
@@ -187,9 +378,15 @@ impl TextGeneration {
         let mut hfb_n = 0usize;
         let mut raw_sum = 0f64;
         let mut raw_n = 0usize;
-        for index in 0..sample_len {
+        for index in 0..opts.max_tokens {
+            if let Some(cancel) = opts.cancel
+                && cancel.load(Ordering::Relaxed)
+            {
+                reason = StopReason::Cancelled;
+                break;
+            }
             let step_start = std::time::Instant::now();
-            let context_size = if index > 0 { 1 } else { tokens.len() };
+            let context_size = if index > 0 { 1 } else { tokens.len() - base };
             let start_pos = tokens.len().saturating_sub(context_size);
             let t = std::time::Instant::now();
             let (logits, fb_stats): (Tensor, Option<FeedbackStats>) = if has_enricher {
@@ -247,6 +444,8 @@ impl TextGeneration {
                 }
             };
             let forward = t.elapsed();
+            // the cache grew by the forwarded chunk (prefill) or token
+            cache_len += context_size;
             let mut fb_logits = if self.softmax_feedback {
                 Some(logits.clone())
             } else {
@@ -286,12 +485,23 @@ impl TextGeneration {
                 None
             };
 
-            if self.repeat_penalty != 1. {
-                let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                apply_repeat_penalty(&mut logits, self.repeat_penalty, &tokens[start_at..]);
+            if opts.sampling.repeat_penalty != 1. {
+                let start_at = tokens.len().saturating_sub(opts.sampling.repeat_last_n);
+                apply_repeat_penalty(
+                    &mut logits,
+                    opts.sampling.repeat_penalty,
+                    &tokens[start_at..],
+                );
             }
 
-            let next_token = self.logits_processor.sample(&mut logits);
+            if let Some(filter) = opts.filter.as_mut() {
+                filter.mask(&mut logits);
+            }
+
+            let next_token = logits_processor.sample(&mut logits);
+            if let Some(filter) = opts.filter.as_mut() {
+                filter.on_token(next_token);
+            }
             prev_fb = fb_logits.take().map(|l| (l, next_token));
             let sampling = t.elapsed();
             if index == 0 {
@@ -349,27 +559,60 @@ impl TextGeneration {
                 );
             }
             if self.eos_tokens.contains(&next_token) {
+                reason = StopReason::Eos;
                 break;
             }
-            if stream && let Some(t) = self.tokenizer.next_token(next_token)? {
-                print!("{t}");
-                std::io::stdout().flush()?;
+            if !opts.stop_strings.is_empty() {
+                if let Ok(piece) = self.tokenizer.tokenizer().decode(&[next_token], true) {
+                    recent.push_str(&piece);
+                    let keep = 128usize;
+                    if recent.chars().count() > keep {
+                        let skip = recent.chars().count() - keep;
+                        recent = recent.chars().skip(skip).collect();
+                    }
+                }
+                if let Some(s) = opts
+                    .stop_strings
+                    .iter()
+                    .find(|s| recent.contains(s.as_str()))
+                {
+                    reason = StopReason::Stopped(s.clone());
+                    break;
+                }
+            }
+            if let Some(sink) = opts.stream.as_mut()
+                && let Some(t) = self.tokenizer.next_token(next_token)?
+            {
+                sink(&t)?;
             }
         }
-        let text = self
+        if let Some(sink) = opts.stream.as_mut()
+            && let Some(rest) = self.tokenizer.decode_rest()?
+        {
+            sink(&rest)?;
+        }
+        let mut text = self
             .tokenizer
             .tokenizer()
             .decode(&tokens[prompt_len..], true)
             .map_err(E::msg)
             .unwrap_or_default();
+        if let StopReason::Stopped(s) = &reason
+            && let Some(pos) = text.find(s.as_str())
+        {
+            text.truncate(pos);
+        }
         let outcome = GenerationOutcome {
             text,
             tokens: generated_tokens,
+            reason,
+            context_ids: tokens[..cache_len.min(tokens.len())].to_vec(),
             mean_hfb: (hfb_n > 0).then_some(hfb_sum / hfb_n as f64),
             mean_raw_h: (raw_n > 0).then_some(raw_sum / raw_n as f64),
         };
         let timing = GenerationTiming {
             prompt_len,
+            reused_prefix,
             prefill: prefill_total,
             decode_tokens,
             decode_forward,
@@ -380,16 +623,23 @@ impl TextGeneration {
         Ok((outcome, timing))
     }
 
-    pub fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
-        let (outcome, timing) = self.generate(prompt, sample_len, true)?;
-        if let Some(rest) = self.tokenizer.decode_rest()? {
-            print!("{rest}");
+    /// One-shot generation with stdout streaming plus the timing report
+    /// (the `--prompt` CLI path).
+    pub fn run_with(&mut self, prompt: &str, mut opts: GenerateOptions<'_>) -> Result<()> {
+        if opts.stream.is_none() {
+            opts.stream = Some(Box::new(|chunk: &str| -> Result<()> {
+                print!("{chunk}");
+                std::io::stdout().flush()?;
+                Ok(())
+            }));
         }
+        let (outcome, timing) = self.generate(prompt, opts)?;
         std::io::stdout().flush()?;
         println!(
-            "\n{} tokens generated ({:.2} token/s)",
+            "\n{} tokens generated ({:.2} token/s, reason: {})",
             outcome.tokens,
             outcome.tokens as f64 / timing.total.as_secs_f64(),
+            outcome.reason,
         );
         println!(
             "prefill: {} tokens in {:.1} ms ({:.2} ms/token)",
@@ -397,6 +647,13 @@ impl TextGeneration {
             timing.prefill.as_secs_f64() * 1000.0,
             timing.prefill.as_secs_f64() * 1000.0 / timing.prompt_len.max(1) as f64,
         );
+        let prefilled = timing.prompt_len.saturating_sub(timing.reused_prefix);
+        if timing.reused_prefix > 0 {
+            println!(
+                "kv reuse: {} tokens served from the cache, {} re-prefilled",
+                timing.reused_prefix, prefilled
+            );
+        }
         if timing.decode_tokens > 0 {
             let decode_ms = timing.decode_total.as_secs_f64() * 1000.0;
             let forward_ms = timing.decode_forward.as_secs_f64() * 1000.0;
@@ -420,5 +677,22 @@ impl TextGeneration {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_len_requires_prefix_match() {
+        let full = [10, 20, 30, 40, 50];
+        assert_eq!(resume_len(&full, None), 0);
+        assert_eq!(resume_len(&full, Some(&[10, 20, 30])), 3);
+        assert_eq!(resume_len(&full, Some(&[10, 20, 30, 40, 50])), 5);
+        assert_eq!(resume_len(&full, Some(&[10, 21, 30])), 0);
+        assert_eq!(resume_len(&full, Some(&[11, 20])), 0);
+        assert_eq!(resume_len(&full, Some(&[10, 20, 30, 40, 50, 60])), 0);
+        assert_eq!(resume_len(&[], Some(&[1])), 0);
     }
 }

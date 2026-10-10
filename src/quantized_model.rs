@@ -220,6 +220,7 @@ pub struct QuantizedModel {
     device: Device,
     dtype: DType,
     hidden_size: usize,
+    max_positions: usize,
     sliding_window: usize,
     feedback: FeedbackConfig,
     /// Current temperature for the Heuristic mode; reset by clear_kv_cache.
@@ -380,6 +381,7 @@ impl QuantizedModel {
             device: device.clone(),
             dtype: DType::F32,
             hidden_size: cfg.hidden_size,
+            max_positions: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,
             feedback,
             heuristic_t: feedback.temperature,
@@ -746,6 +748,14 @@ impl QuantizedModel {
 
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
+    }
+
+    pub fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
+    pub fn sliding_window(&self) -> usize {
+        self.sliding_window
     }
 
     pub fn clear_kv_cache(&mut self) {

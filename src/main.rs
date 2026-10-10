@@ -12,6 +12,7 @@ use crossbar::engine::Engine;
 use crossbar::generation;
 use crossbar::model;
 use crossbar::quantized_model;
+use crossbar::repl;
 use crossbar::train;
 
 fn main() -> Result<()> {
@@ -173,12 +174,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let prompt = args
-        .prompt
-        .as_deref()
-        .context("--prompt is required unless --probe or --bench is set")?;
-    let prompt = chat::render(&chat_template, args.system.as_deref(), prompt)?;
-
     let do_sample = generation_config.do_sample.unwrap_or(true);
     let temperature = if do_sample {
         Some(
@@ -191,6 +186,44 @@ fn main() -> Result<()> {
     };
     let top_k = args.top_k.or(generation_config.top_k);
     let top_p = args.top_p.or(generation_config.top_p);
+
+    let sampling = generation::SamplingParams {
+        temperature,
+        top_k,
+        top_p,
+        repeat_penalty: args.repeat_penalty,
+        repeat_last_n: args.repeat_last_n,
+        seed: Some(args.seed),
+    };
+
+    if args.repl {
+        let pipeline = generation::TextGeneration::new(
+            engine,
+            tokenizer,
+            eos_tokens.clone(),
+            &device,
+            args.debug_logits,
+            fb.softmax_feedback,
+            fb.prefill_feedback_blend > 0.0,
+            fb.softmax_feedback_diagnostics,
+        );
+        let config = repl::ReplConfig {
+            sampling,
+            max_tokens: 512,
+            tool_mode: args.tools,
+            system: args.system.clone(),
+            max_positions: pipeline.max_context(),
+        };
+        repl::run(pipeline, chat_template, eos_tokens, config)?;
+        return Ok(());
+    }
+
+    let prompt = args
+        .prompt
+        .as_deref()
+        .context("--prompt is required unless --probe, --bench or --repl is set")?;
+    let prompt = chat::render(&chat_template, args.system.as_deref(), prompt)?;
+
     println!(
         "temp: {:.2} top-k: {} top-p: {} repeat-penalty: {:.2} repeat-last-n: {}",
         temperature.unwrap_or(1.0),
@@ -232,12 +265,6 @@ fn main() -> Result<()> {
     let mut pipeline = generation::TextGeneration::new(
         engine,
         tokenizer,
-        args.seed,
-        temperature,
-        top_k,
-        top_p,
-        args.repeat_penalty,
-        args.repeat_last_n,
         eos_tokens,
         &device,
         args.debug_logits,
@@ -245,6 +272,11 @@ fn main() -> Result<()> {
         fb.prefill_feedback_blend > 0.0,
         fb.softmax_feedback_diagnostics,
     );
-    pipeline.run(&prompt, args.sample_len)?;
+    let opts = generation::GenerateOptions {
+        sampling,
+        max_tokens: args.sample_len,
+        ..Default::default()
+    };
+    pipeline.run_with(&prompt, opts)?;
     Ok(())
 }

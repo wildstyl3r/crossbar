@@ -8,7 +8,7 @@ use tokenizers::Tokenizer;
 
 use crate::Engine;
 use crate::chat;
-use crate::generation::TextGeneration;
+use crate::generation::{GenerateOptions, SamplingParams, TextGeneration};
 use crate::model::{FeedbackConfig, FeedbackTempMode};
 use crate::tasks::{first_nonempty_line, last_int, shuffle};
 
@@ -517,12 +517,6 @@ pub fn run_bench(
         let mut pipeline = TextGeneration::new(
             engine,
             tokenizer.clone(),
-            0,
-            Some(0.0),
-            None,
-            None,
-            1.0,
-            64,
             eos_tokens.clone(),
             device,
             false,
@@ -533,7 +527,12 @@ pub fn run_bench(
         pipeline.set_collect_stats(true);
         for (xi, ex) in examples.iter().enumerate() {
             let rendered = chat::render(chat_template, None, &ex.prompt)?;
-            let (outcome, _) = pipeline.generate(&rendered, ex.max_tokens, false)?;
+            let opts = GenerateOptions {
+                sampling: SamplingParams::greedy(),
+                max_tokens: ex.max_tokens,
+                ..Default::default()
+            };
+            let (outcome, _) = pipeline.generate(&rendered, opts)?;
             let (correct, pred) = score(ex, &outcome.text);
             results[mi][xi] = correct;
             lens[mi][xi] = outcome.tokens;
