@@ -354,6 +354,7 @@ impl Enricher {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
         let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
         map.insert(CFG_NAME.to_string(), cfg_tensor(&self.spec)?);
         if let Some(w) = &self.w {
@@ -372,7 +373,13 @@ impl Enricher {
         }
         map.insert("enrich.gate_w".to_string(), self.gate_w.clone());
         map.insert("enrich.gate_b".to_string(), self.gate_b.clone());
-        candle::safetensors::save(&map, path.as_ref())?;
+        // Atomic write: serialize to a sibling temp file, then rename over the
+        // target — a kill/OOM mid-save cannot corrupt the last good checkpoint.
+        let mut tmp: std::ffi::OsString = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        candle::safetensors::save(&map, &tmp)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 

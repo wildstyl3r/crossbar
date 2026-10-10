@@ -45,7 +45,9 @@ state-readout enricher (see ENRICHER.md, FEEDBACK.md).
 Enricher checkpoints carry an `enrich.cfg` tensor (5 floats in v2.2+: rank,
 gelu, content-gate, a-mode, residual). M1-era files (`enrich.w_q/w_k/w_v/w_o`,
 no cfg) are incompatible with the current residual-stream readout
-(ENRICHER.md) — expected to fail loading.
+(ENRICHER.md) — expected to fail loading. Saves are atomic: serialized to
+`<path>.tmp` then renamed over the target, so a mid-write kill cannot corrupt
+the last good checkpoint (`Enricher::save`).
 
 ## Tests
 

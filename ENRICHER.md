@@ -472,7 +472,7 @@ overnight pair is **d64, pick vs none** — it is the cell whose effect
 survived seed replication. d128 drops (inconclusive + 2x probe CE seed
 spread); only its residual mode is carried, as an exploratory cell.
 
-### Claim-R overnight configs (documented 2026-10-08, NOT yet run)
+### Claim-R overnight configs (documented 2026-10-08; run 2 done 2026-10-10, control + d128 pending)
 
 Three runs, the doc's overnight recipe (tau=6 exact KV, batch 4 x accum 4,
 600 + 1800 micros = 600 effective steps ~ 8 h each, lr ramp 50 default,
@@ -518,6 +518,92 @@ Verdict metrics after the overnights: the standard battery (held-out EM,
 free-running greedy EM + guided-first, digits/trivia bench transfer) —
 free-running EM, not probe CE, decides Claim R; findings then land in
 FEEDBACK.md.
+
+### Claim-R overnight run 2 (d64 pick, 2026-10-10): clean mechanics, real forced-mode signal, free-running + transfer destroyed
+
+Run #2 (seed 31337): ~6.5 h (600 + 1800 micros at ~9.4 s/micro), 74 checkpoints
+at the 5-min cadence (saves now atomic — tmp + rename, a mid-write kill cannot
+corrupt the last good checkpoint), zero aborts. Trajectory mechanically clean
+everywhere: gate 0.94 -> 0.998 flat (the floor annealed away without sag),
+alpha 0.120-0.130 / rem 0.022-0.027 / degen 0 all night (expected band), RSS
+~7.0 GB steady (above the 4-5 GB estimate; watch item). Pregate 0.03-0.06 —
+never entered the 0.25-1x band: the lambda-1.0 tax plus the ST lr held
+injection small all night. Applied p/ans ended ~0.05/0.4 — answer-slot-
+concentrated with prompt-side starved (doc risk #1: prompt-side gets no credit
+beyond the tau window; the KV-path credit did not materialize at this scale).
+CE ~0.8-1.0 stable through the forcing anneal; no ST-entry shock (p_forced
+anneals over 1800 micros, so the v2-1-style bump is smeared across the first
+few hundred steps).
+
+Held-out (100 examples):
+
+| metric | baseline | trained |
+|---|---|---|
+| teacher-forced EM | 37.9% | **65.8%** |
+| free-running EM | 26.5% | 26.0% |
+| FR, first-token-guided | 86.5% | **57.0%** |
+
+Probe (trained checkpoint, held-out): gate 0.998 | pregate 0.085 | applied
+0.056/0.634 | ce 2.185 (fresh baseline 4.274) — the forced-mode signal is
+real.
+
+Bench transfer (digits-20 n=100, trivia n=40; enricher mode = cascade
+everywhere):
+
+| task | baseline | enricher | p |
+|---|---|---|---|
+| digits-20 | 100% | **0%** | 0.000 |
+| trivia | 72% | **2%** | 0.000 |
+
+Findings:
+
+1. **The pick-readout learns a usable state summary under forcing**: TF-EM
+   +28 points, probe CE halved (2.19 vs 4.27) — the smoke's d64-pick CE wins
+   carry to overnight scale.
+2. **Zero free-running transfer, plus active destabilization**: FR-EM flat
+   (-0.5); guided-first drops 29.5 points — with a correct first token the
+   trained cascade derails continuations, and the trained-guided misses are
+   name-blend attractors ("Kitu", "Milorp" — echo texture). Small per-step
+   injections compound over self-generated states: the
+   TF-CE-flatters-over-injection regime, now at tiny injection scale.
+3. **Off-task the module is catastrophic**: digits 100 -> 0%, trivia 72 ->
+   2%. Diagnostic (2026-10-10): a FRESH identity enricher of the same variant
+   on digits-20 scores 100% (p=1.000, token counts identical) — the
+   cascade-prefill bench path is bit-exact at B=0, so **the trained weights
+   alone** cause the collapse. The enricher mode perturbs every prompt
+   position (~90 injections accumulate in the KV before the answer), and the
+   module only ever saw state-track/induce-d states: off-distribution, its
+   injections are poison.
+4. **No Claim-R verdict** — this is half the pair. The d64-none control
+   (run #1) is required to attribute both the guided-first destabilization and
+   the transfer collapse to the residual treatment vs the v2 recipe itself.
+   d128-pick (run #3) and the tau-8 revisit defer until the control reads out.
+5. **Option (c) aux local CE is now triggered**: its deferral condition was
+   "add only if the cross-step grad share shows prompt-side learning is
+   starved" — applied p/ans 0.05/0.4 with prompt-side flat all night is
+   exactly that signal.
+
+### Fresh-identity bench diagnostic (2026-10-10): the trained weights are the poison, not the cascade path
+
+A fresh identity enricher of the same variant (rank 64, gelu, pick, seed
+31337; built by the 0-step sweep recipe, fresh-init signature b 3.247 —
+matches the recorded fresh-pick signature) run through the identical bench
+invocation, digits-20 n=100:
+
+| | digits-20 |
+|---|---|
+| baseline mode | 100% |
+| fresh-identity enricher mode | 100% (p=1.000, mean tokens 40.7 == 40.7) |
+| trained enricher mode (run 2) | 0% |
+
+The cascade-prefill bench path is bit-exact at B=0 — **the trained weights
+alone cause the off-task collapse** (and, by extension, the guided-first
+destabilization). Interpretation: the module only ever saw state-track /
+induce-d state distributions; off-distribution its per-step injections are
+poison, and the bench mode applies ~90 of them over the prompt before the
+answer. Consequence for the eval battery: the fresh-identity bench row is the
+cheap control that separates "path damage" from "weight damage" — run it
+whenever an enricher bench row collapses.
 
 ## Training as RNN BPTT
 
