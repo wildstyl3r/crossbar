@@ -472,7 +472,7 @@ overnight pair is **d64, pick vs none** — it is the cell whose effect
 survived seed replication. d128 drops (inconclusive + 2x probe CE seed
 spread); only its residual mode is carried, as an exploratory cell.
 
-### Claim-R overnight configs (documented 2026-10-08; run 2 done 2026-10-10, control + d128 pending)
+### Claim-R overnight configs (documented 2026-10-08; runs 1-2 done 2026-10-10/11, d128 pending)
 
 Three runs, the doc's overnight recipe (tau=6 exact KV, batch 4 x accum 4,
 600 + 1800 micros = 600 effective steps ~ 8 h each, lr ramp 50 default,
@@ -604,6 +604,57 @@ poison, and the bench mode applies ~90 of them over the prompt before the
 answer. Consequence for the eval battery: the fresh-identity bench row is the
 cheap control that separates "path damage" from "weight damage" — run it
 whenever an enricher bench row collapses.
+
+### Claim-R overnight run 1 (d64 none control, 2026-10-11): recipe-wide damage confirmed — pick is the milder failure
+
+Run #1 executed at a DEVIATED split: 300 warmup + 2100 ST (same 2400-micro
+total; the warmup->ST reallocation was a deliberate second variable, so the
+pick-vs-none attribution is confounded — accepted before launch). ~6.1 h
+train + eval (the 14 h wall gap was machine suspension), 0 aborts, mechanics
+clean (gate 0.995-0.998 flat, no collapse, RSS ~7.0 GB).
+
+Trajectory differences vs run 2 (pick): the none readout injects far more
+aggressively — pregate 0.23 by ST 0 (pick never left 0.03-0.06), applied
+answer-side climbing to **1.0-1.65x input energy in the late anneal** (the
+watch-list takeover line, crossed on the applied side; pregate itself stayed
+<= 0.23). Held-out probe: applied 0.079/**1.579**, ce 2.520 (pick 0.634,
+2.185). The fully-on-policy tail showed instability spikes (st 2060-2070:
+CE 4.6, |g| 34-53) — the compounding loop visible in training itself.
+
+Verdict metrics (100 held-out; pick numbers in parens):
+
+| metric | baseline | none (pick) |
+|---|---|---|
+| teacher-forced EM | 37.9% | 59.1% (65.8%) |
+| free-running EM | 26.5% | **15.5%** (26.0%) |
+| FR, first-token-guided | 86.5% | **39.5%** (57.0%) |
+| digits-20 bench | 100% | 0% (0%) |
+| trivia bench | 72% | 5% (2%) |
+
+Findings:
+
+1. **The damage is v2-recipe-wide, not Claim-R-specific**: the none control
+   collapses off-task (digits 0%, trivia 5%) and destabilizes free-running
+   (FR -11, guided -47 vs baseline) — the same failure class as pick, only
+   worse. The residual treatment is exonerated as the special culprit.
+2. **Pick was the milder failure on every deployment metric** while matching
+   the TF gain (65.8 vs 59.1): the pick-orthogonalization demonstrably brakes
+   injection growth at scale (3-5x less energy, applied never left ~0.5x vs
+   none's 1.6x) — Claim R's anti-echo mechanism measurably works, and the
+   smoke's "pick pregate <= none" hint holds at overnight scale with a wide
+   margin.
+3. **The split did not rescue free-running** (none@300+2100 is worse than
+   pick@600+1800): more on-policy exposure at the current guards lets the
+   injection grow into the takeover band instead of stabilizing deployment.
+   The confound (residual x split) is unresolved for exact attribution, but
+   the qualitative conclusion (recipe-wide damage) does not depend on it.
+4. **The central blocker is now the paradigm, not the variant**: per-step
+   injection helps only the forced training tasks and poisons everything
+   else. Doc levers next: (c) aux local CE (triggered, see run-2 finding 5)
+   for prompt-side credit; bench-informed state coverage (the module never
+   saw off-task state distributions); an applied-energy cap given the gate
+   never closes (0.998) — note the M1 post-gate-tax objection assumed the
+   gate could close, which it demonstrably does not here.
 
 ## Training as RNN BPTT
 
