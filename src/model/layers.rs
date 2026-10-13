@@ -98,7 +98,7 @@ impl RotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Mlp {
+pub(crate) struct Mlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
@@ -134,20 +134,20 @@ pub(crate) enum KvCacheKind {
     Rotating(RotatingKvCache),
 }
 
-pub(super) struct Attention {
-    pub(super) q_proj: Linear,
-    pub(super) k_proj: Linear,
-    pub(super) v_proj: Linear,
-    pub(super) o_proj: Linear,
-    pub(super) q_norm: RmsNorm,
-    pub(super) k_norm: RmsNorm,
-    pub(super) num_heads: usize,
-    pub(super) num_kv_heads: usize,
-    pub(super) num_kv_groups: usize,
-    pub(super) head_dim: usize,
-    pub(super) query_pre_attn_scalar: usize,
-    pub(super) attn_logit_softcapping: Option<f64>,
-    pub(super) rotary_emb: Arc<RotaryEmbedding>,
+pub(crate) struct Attention {
+    pub(crate) q_proj: Linear,
+    pub(crate) k_proj: Linear,
+    pub(crate) v_proj: Linear,
+    pub(crate) o_proj: Linear,
+    pub(crate) q_norm: RmsNorm,
+    pub(crate) k_norm: RmsNorm,
+    pub(crate) num_heads: usize,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) num_kv_groups: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) query_pre_attn_scalar: usize,
+    pub(crate) attn_logit_softcapping: Option<f64>,
+    pub(crate) rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: KvCacheKind,
 }
 
@@ -269,14 +269,14 @@ pub(crate) fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     }
 }
 
-pub(super) struct DecoderLayer {
-    pub(super) self_attn: Attention,
-    pub(super) mlp: Mlp,
-    pub(super) input_layernorm: RmsNorm,
-    pub(super) pre_feedforward_layernorm: RmsNorm,
-    pub(super) post_feedforward_layernorm: RmsNorm,
-    pub(super) post_attention_layernorm: RmsNorm,
-    pub(super) sliding_window: Option<usize>,
+pub(crate) struct DecoderLayer {
+    pub(crate) self_attn: Attention,
+    pub(crate) mlp: Mlp,
+    pub(crate) input_layernorm: RmsNorm,
+    pub(crate) pre_feedforward_layernorm: RmsNorm,
+    pub(crate) post_feedforward_layernorm: RmsNorm,
+    pub(crate) post_attention_layernorm: RmsNorm,
+    pub(crate) sliding_window: Option<usize>,
 }
 
 impl DecoderLayer {

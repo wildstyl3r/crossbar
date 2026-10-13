@@ -5,10 +5,15 @@ use candle::quantized::{QMatMul as InnerQMatMul, QTensor, gguf_file};
 use candle::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Embedding, kv_cache::KvCache, kv_cache::RotatingKvCache};
 
-use crate::model::{
-    Config, FeedbackConfig, FeedbackStats, FeedbackTempMode, KvCacheKind, PrefillStats, ProbeOut,
-    RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask, repeat_kv, solve_entropy_temperature,
+use crate::config::Config;
+use crate::experiments::enrich;
+use crate::experiments::feedback::{
+    FeedbackConfig, FeedbackStats, FeedbackTempMode, PrefillStats, solve_entropy_temperature,
 };
+use crate::model::layers::{
+    KvCacheKind, RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask, repeat_kv,
+};
+use crate::model::ProbeOut;
 
 struct QMatMul {
     inner: InnerQMatMul,
@@ -229,7 +234,7 @@ pub struct QuantizedModel {
     last_input: Option<(Tensor, f64)>,
     /// Optional trained attention-pooling enricher; when present it replaces
     /// the softmax-blend formula for the decode input.
-    pub enricher: Option<crate::enrich::Enricher>,
+    pub enricher: Option<enrich::Enricher>,
     /// F32 copy of the embedding table, built lazily for the softmax
     /// feedback (the stored table is BF16).
     embeddings_f32: Option<Tensor>,
@@ -701,7 +706,7 @@ impl QuantizedModel {
 
     /// Attach a trained enricher (inference); replaces the softmax-blend
     /// decode feedback with the learned state-readout enrichment.
-    pub fn set_enricher(&mut self, enr: crate::enrich::Enricher) {
+    pub fn set_enricher(&mut self, enr: enrich::Enricher) {
         self.enricher = Some(enr);
     }
 

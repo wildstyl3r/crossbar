@@ -8,8 +8,8 @@ use tokenizers::Tokenizer;
 
 use crate::Engine;
 use crate::chat;
-use crate::enrich::{AMode, Enricher, EnricherSpec};
-use crate::tasks::{Example, HELDOUT_PAIRS, TRAIN_PAIRS, build_dataset, score, shuffle};
+use crate::experiments::enrich::{AMode, Enricher, EnricherSpec};
+use crate::experiments::tasks::{Example, HELDOUT_PAIRS, TRAIN_PAIRS, build_dataset, score, shuffle};
 
 /// Training hyperparameters. Defaults restore the healthy-warmup recipe
 /// (gate bias +2 open-start, lr ramp 50, gate floor 0.5) with the v2
@@ -413,7 +413,7 @@ fn pca_calibrate(engine: &Engine, enr: &mut Enricher, batches: &[Batch]) -> Resu
     // Power-style iteration: orthonormalize an initial [H, d] guess, then
     // repeatedly (gram, orthonormalize). Gram is symmetric PSD by
     // construction.
-    let seed_a = crate::enrich::randn_rows(hidden, d, 1.0, 4243)?;
+    let seed_a = crate::experiments::enrich::randn_rows(hidden, d, 1.0, 4243)?;
     let mut v = orthonormalize(&seed_a)?;
     for it in 0..PCA_ITERS {
         v = orthonormalize(&gram.matmul(&v)?)?;

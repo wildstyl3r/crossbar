@@ -5,15 +5,17 @@ use clap::Parser;
 use tokenizers::Tokenizer;
 
 use crossbar::assets::{GenerationConfig, find_gguf_file, resolve_file};
-use crossbar::bench;
+use crossbar::experiments::bench;
 use crossbar::chat;
 use crossbar::cli::Args;
+use crossbar::config;
 use crossbar::engine::Engine;
+use crossbar::experiments::feedback::{FeedbackConfig, FeedbackTempMode};
 use crossbar::generation;
 use crossbar::model;
 use crossbar::quantized_model;
 use crossbar::repl;
-use crossbar::train;
+use crossbar::experiments::train;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -55,14 +57,14 @@ fn main() -> Result<()> {
             "safetensors"
         }
     );
-    let make_engine = |feedback: model::FeedbackConfig| -> Result<Engine> {
+    let make_engine = |feedback: FeedbackConfig| -> Result<Engine> {
         if let Some(ref gguf_path) = gguf_file {
             let mut reader = std::fs::File::open(gguf_path)?;
             Ok(Engine::Quantized(
                 quantized_model::QuantizedModel::from_gguf(&mut reader, &device, feedback)?,
             ))
         } else {
-            let config: model::Config = serde_json::from_reader(std::fs::File::open(
+            let config: config::Config = serde_json::from_reader(std::fs::File::open(
                 resolve_file(model_dir, fallback_dir, "config.json")?,
             )?)?;
             let dtype = if device.is_cuda() {
@@ -242,7 +244,7 @@ fn main() -> Result<()> {
             fb.softmax_feedback_target_entropy,
             fb.softmax_feedback_blend
         );
-        if fb.softmax_feedback_mode == model::FeedbackTempMode::Heuristic {
+        if fb.softmax_feedback_mode == FeedbackTempMode::Heuristic {
             println!(
                 "  heuristic band: {:.2}, decay: {:.2}, max cosine: {:.3}",
                 fb.softmax_feedback_band, fb.softmax_feedback_decay, fb.softmax_feedback_max_cosine

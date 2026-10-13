@@ -9,8 +9,8 @@ use tokenizers::Tokenizer;
 use crate::Engine;
 use crate::chat;
 use crate::generation::{GenerateOptions, SamplingParams, TextGeneration};
-use crate::model::{FeedbackConfig, FeedbackTempMode};
-use crate::tasks::{first_nonempty_line, last_int, shuffle};
+use crate::experiments::feedback::{FeedbackConfig, FeedbackTempMode};
+use crate::experiments::tasks::{first_nonempty_line, last_int, shuffle};
 
 struct BenchMode {
     label: &'static str,

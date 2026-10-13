@@ -1,38 +1,36 @@
 //! Gemma-3 F32 (safetensors) model: architecture wiring and inference paths
 //! (plain forward, softmax feedback, prefill cascade, enricher cascade).
 
-mod cascade;
-mod layers;
+pub(crate) mod layers;
 
-pub use crate::config::Config;
-pub(crate) use crate::feedback::solve_entropy_temperature;
-pub use crate::feedback::{FeedbackConfig, FeedbackStats, FeedbackTempMode, PrefillStats};
-pub use cascade::CascadeTrainOut;
-pub(crate) use layers::{
-    KvCacheKind, RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask, repeat_kv,
+use crate::config::Config;
+pub(crate) use crate::experiments::feedback::solve_entropy_temperature;
+use crate::experiments::feedback::{
+    FeedbackConfig, FeedbackStats, FeedbackTempMode, PrefillStats,
 };
+pub(crate) use layers::{RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask};
 
 use std::sync::Arc;
 
 use candle::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Embedding, Linear, VarBuilder};
 
-use crate::enrich;
+use crate::experiments::enrich;
 use layers::DecoderLayer;
 
 pub(crate) type ProbeOut = ((Vec<f32>, f64), Vec<(u32, f32)>);
 
 pub struct Model {
-    embed_tokens: Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    lm_head: Linear,
-    final_logit_softcapping: Option<f64>,
-    device: Device,
-    dtype: DType,
-    hidden_size: usize,
+    pub(crate) embed_tokens: Embedding,
+    pub(crate) layers: Vec<DecoderLayer>,
+    pub(crate) norm: RmsNorm,
+    pub(crate) lm_head: Linear,
+    pub(crate) final_logit_softcapping: Option<f64>,
+    pub(crate) device: Device,
+    pub(crate) dtype: DType,
+    pub(crate) hidden_size: usize,
     max_positions: usize,
-    sliding_window: usize,
+    pub(crate) sliding_window: usize,
     feedback: FeedbackConfig,
     /// Current temperature for the Heuristic mode; reset by clear_kv_cache.
     heuristic_t: f64,

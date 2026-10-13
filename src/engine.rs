@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 
-use crate::enrich;
+use crate::experiments::cascade::CascadeTrainOut;
+use crate::experiments::enrich;
+use crate::experiments::feedback::{FeedbackStats, PrefillStats};
 use crate::model;
 use crate::quantized_model;
 
@@ -28,7 +30,7 @@ impl Engine {
         logits: &candle::Tensor,
         sampled_token: u32,
         pos: usize,
-    ) -> candle::Result<(candle::Tensor, model::FeedbackStats)> {
+    ) -> candle::Result<(candle::Tensor, FeedbackStats)> {
         match self {
             Self::F32(m) => m.forward_feedback(logits, sampled_token, pos),
             Self::Quantized(m) => m.forward_feedback(logits, sampled_token, pos),
@@ -38,7 +40,7 @@ impl Engine {
     pub fn forward_prompt_blend(
         &mut self,
         input_ids: &candle::Tensor,
-    ) -> candle::Result<(candle::Tensor, model::PrefillStats)> {
+    ) -> candle::Result<(candle::Tensor, PrefillStats)> {
         match self {
             Self::F32(m) => m.forward_prompt_blend(input_ids),
             Self::Quantized(m) => m.forward_prompt_blend(input_ids),
@@ -98,7 +100,7 @@ impl Engine {
         forced_prob: f64,
         gt: f64,
         rng: &mut rand::rngs::StdRng,
-    ) -> Result<model::CascadeTrainOut> {
+    ) -> Result<CascadeTrainOut> {
         match self {
             Self::F32(m) => Ok(m.cascade_train_forward(
                 enr,

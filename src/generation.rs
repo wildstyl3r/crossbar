@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokenizers::Tokenizer;
 
 use crate::Engine;
-use crate::model::FeedbackStats;
+use crate::experiments::feedback::FeedbackStats;
 use crate::sampling::{LogitsProcessor, apply_repeat_penalty};
 
 pub struct TokenOutputStream {

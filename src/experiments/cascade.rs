@@ -3,10 +3,10 @@
 use candle::{DType, Module, Result, Tensor};
 use rand::Rng as _;
 
-use crate::enrich::Enricher;
+use crate::experiments::enrich::Enricher;
 
-use super::Model;
-use super::layers::{DecoderLayer, repeat_kv};
+use crate::model::Model;
+use crate::model::layers::{DecoderLayer, repeat_kv};
 
 /// Output of the cascade training forward.
 pub struct CascadeTrainOut {
@@ -62,7 +62,7 @@ impl DecoderLayer {
     /// chain gradient survives via the state. This is the memory-safe
     /// default (the full KV path holds O(layers * tau * seq) activations
     /// and OOM-killed a 14 GB machine at tau=16; see ENRICHER.md).
-    pub(super) fn cascade_train_step(
+    fn cascade_train_step(
         &self,
         h: &Tensor,
         pos: usize,
