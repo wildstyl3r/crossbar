@@ -121,7 +121,9 @@ stagnation trigger cos > 0.999) also held the line on the acacia config, but
 T oscillates between band edges (1.28–3.13) instead of settling. Notably the
 stagnation (cosine) trigger never fired — the entropy band did all the work;
 the consecutive-cosine signal was redundant *here* (it may still matter for
-low-entropy loops). Retained as a fallback and for comparison.
+low-entropy loops). Removed from the CLI after Findings 3/5: the one-sided
+servo dominates it (settles instead of oscillating, and tames without
+blurring confident regimes).
 
 ## Finding 5: forcing diversity hurts confident regimes — hence the one-sided servo
 
@@ -392,11 +394,6 @@ cargo run --release -- --cpu -p "Once upon a time" -n 40 --seed 7 \
 # one-sided servo (tames only; closest to normal generation when confident)
 cargo run --release -- --cpu -p "Once upon a time" -n 40 --seed 7 \
     --softmax-feedback --softmax-feedback-mode one-sided-servo
-
-# threshold heuristic
-cargo run --release -- --cpu -p "Once upon a time" -n 40 --seed 7 \
-    --softmax-feedback --softmax-feedback-mode heuristic \
-    --softmax-feedback-band 1.0 --softmax-feedback-decay 0.8
 
 # GGUF backend works identically (materializes an F32 copy of the embedding
 # table, ~671 MB, lazily on the first feedback step)

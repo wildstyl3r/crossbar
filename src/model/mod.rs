@@ -31,8 +31,6 @@ pub struct Model {
     max_positions: usize,
     pub(crate) sliding_window: usize,
     feedback: FeedbackConfig,
-    /// Current temperature for the Heuristic mode; reset by clear_kv_cache.
-    heuristic_t: f64,
     /// Previous fed-back input and its norm, for the consecutive cosine.
     last_input: Option<(Tensor, f64)>,
     /// Optional trained attention-pooling enricher; when present it replaces
@@ -83,7 +81,6 @@ impl Model {
             max_positions: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,
             feedback,
-            heuristic_t: feedback.temperature,
             last_input: None,
             enricher: None,
         })
@@ -252,7 +249,6 @@ impl Model {
                 self.feedback.target_entropy * n_positions as f64,
             )
             .map(|t| t.min(1.0)),
-            FeedbackTempMode::Heuristic => Ok(self.heuristic_t),
         }
     }
 
@@ -318,18 +314,6 @@ impl Model {
             None => f64::NAN,
         };
         self.last_input = Some((xs_f32, norm));
-        if matches!(self.feedback.mode, FeedbackTempMode::Heuristic) {
-            let smear = entropy > self.feedback.target_entropy + self.feedback.band
-                || cosine_prev > self.feedback.max_cosine;
-            let overconfident = entropy < self.feedback.target_entropy - self.feedback.band;
-            let mut next = self.heuristic_t;
-            if smear {
-                next = (next * self.feedback.decay).max(1e-3);
-            } else if overconfident {
-                next = (next / self.feedback.decay).min(20.0);
-            }
-            self.heuristic_t = next;
-        }
         let stats = FeedbackStats {
             temperature,
             entropy,
@@ -467,7 +451,6 @@ impl Model {
 
     pub fn clear_kv_cache(&mut self) {
         self.reset_layer_caches();
-        self.heuristic_t = self.feedback.temperature;
         self.last_input = None;
         if let Some(enr) = &mut self.enricher {
             enr.clear_state();

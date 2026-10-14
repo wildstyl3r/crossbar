@@ -13,10 +13,6 @@ pub enum FeedbackTempMode {
     /// only tames entropy explosions (T < 1) and otherwise falls back to the
     /// model's own distribution (T = 1) instead of blurring confident steps.
     OneSidedServo,
-    /// Persistent temperature, multiplicatively decayed/grown when the
-    /// measured feedback statistics leave the target entropy band or the
-    /// consecutive inputs stagnate.
-    Heuristic,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25,17 +21,10 @@ pub struct FeedbackConfig {
     /// Softmax temperature of the fed-back expected token embedding
     /// softmax(logits / T) @ E_scaled; T -> 0 approaches the argmax token's
     /// embedding (i.e. normal generation), T -> inf the mean embedding.
-    /// Used directly by Fixed and as the base value by Heuristic.
     pub temperature: f64,
     /// Target entropy (nats) of the feedback distribution: exact target for
-    /// EntropyServo and OneSidedServo, band center for Heuristic.
+    /// EntropyServo, capped at 1 for OneSidedServo.
     pub target_entropy: f64,
-    /// Half-width of the entropy band for Heuristic.
-    pub band: f64,
-    /// Multiplicative decay/growth factor for Heuristic.
-    pub decay: f64,
-    /// Consecutive-input cosine above which Heuristic decays the temperature.
-    pub max_cosine: f64,
     /// Weight of the expected embedding in the decode input
     /// (1 - a) * E[sampled] + a * expected; 1.0 is the pure expected input.
     pub blend: f64,

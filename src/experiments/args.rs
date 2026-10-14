@@ -46,7 +46,7 @@ pub struct FeedbackArgs {
 
     /// Softmax temperature for --softmax-feedback; 0 approaches the argmax
     /// token's embedding (i.e. normal generation), large values approach the
-    /// mean embedding. Used as the base value by the heuristic mode.
+    /// mean embedding.
     #[arg(long, default_value_t = 1.0)]
     pub softmax_feedback_temperature: f64,
 
@@ -68,30 +68,16 @@ pub struct FeedbackArgs {
     #[arg(long, default_value_t = 1)]
     pub prefill_feedback_iters: usize,
 
-    /// How the feedback temperature is chosen each step: the fixed value,
-    /// an entropy-matched servo, or a threshold-based heuristic.
+    /// How the feedback temperature is chosen each step: the fixed value or
+    /// an entropy-matched servo (one-sided variants cap the solution at 1).
     #[arg(long, value_enum, default_value = "fixed")]
     pub softmax_feedback_mode: FeedbackTempMode,
 
     /// Target entropy (nats) of the feedback distribution for
-    /// --softmax-feedback-mode entropy-servo (exact) and heuristic (band
-    /// center).
+    /// --softmax-feedback-mode entropy-servo (exact, capped at 1 for the
+    /// one-sided variant).
     #[arg(long, default_value_t = 2.5)]
     pub softmax_feedback_target_entropy: f64,
-
-    /// Half-width of the entropy band for --softmax-feedback-mode heuristic.
-    #[arg(long, default_value_t = 1.0)]
-    pub softmax_feedback_band: f64,
-
-    /// Multiplicative decay/growth factor for --softmax-feedback-mode
-    /// heuristic.
-    #[arg(long, default_value_t = 0.8)]
-    pub softmax_feedback_decay: f64,
-
-    /// Consecutive-feedback cosine above which --softmax-feedback-mode
-    /// heuristic decays the temperature.
-    #[arg(long, default_value_t = 0.999)]
-    pub softmax_feedback_max_cosine: f64,
 
     /// Print per-step feedback diagnostics as CSV lines to stderr.
     #[arg(long)]
@@ -299,9 +285,6 @@ impl Args {
             mode: fb.softmax_feedback_mode,
             temperature: fb.softmax_feedback_temperature,
             target_entropy: fb.softmax_feedback_target_entropy,
-            band: fb.softmax_feedback_band,
-            decay: fb.softmax_feedback_decay,
-            max_cosine: fb.softmax_feedback_max_cosine,
             blend: fb.softmax_feedback_blend,
             prefill_blend: fb.prefill_feedback_blend,
             prefill_iters: fb.prefill_feedback_iters,

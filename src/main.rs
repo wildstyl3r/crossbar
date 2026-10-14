@@ -11,7 +11,7 @@ use crossbar::cli::Args;
 use crossbar::config;
 use crossbar::download;
 use crossbar::engine::Engine;
-use crossbar::experiments::feedback::{FeedbackConfig, FeedbackTempMode};
+use crossbar::experiments::feedback::FeedbackConfig;
 use crossbar::generation;
 use crossbar::model;
 use crossbar::quantized_model;
@@ -218,12 +218,6 @@ fn main() -> Result<()> {
             fb.softmax_feedback_target_entropy,
             fb.softmax_feedback_blend
         );
-        if fb.softmax_feedback_mode == FeedbackTempMode::Heuristic {
-            println!(
-                "  heuristic band: {:.2}, decay: {:.2}, max cosine: {:.3}",
-                fb.softmax_feedback_band, fb.softmax_feedback_decay, fb.softmax_feedback_max_cosine
-            );
-        }
         if fb.softmax_feedback_diagnostics {
             println!("  diagnostics: per-step CSV on stderr");
         }
