@@ -82,7 +82,7 @@ impl RotaryEmbedding {
         })
     }
 
-    pub(crate) fn apply_rotary_emb_qkv(
+    pub(crate) fn apply_rotary_emb_qk(
         &self,
         q: &Tensor,
         k: &Tensor,
@@ -219,7 +219,7 @@ impl Attention {
 
         let (query_states, key_states) =
             self.rotary_emb
-                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+                .apply_rotary_emb_qk(&query_states, &key_states, seqlen_offset)?;
 
         let (key_states, value_states) = match &mut self.kv_cache {
             KvCacheKind::Normal(cache) => cache.append(&key_states, &value_states)?,

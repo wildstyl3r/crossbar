@@ -1,4 +1,4 @@
-# ENRICHER.md — trained state-readout enricher: design, BPTT analysis, plan
+# ENRICHER.md — trained state-readout enricher: design, BPTT analysis, results
 
 ## Motivation and concept
 
@@ -34,63 +34,49 @@ This document specifies the redesigned trained mechanism: a minimal
 **gated state readout** trained as an RNN with truncated BPTT, deployed as
 a sequential cascade over both prompt and answer.
 
-## M1 post-mortem (runs 1-6, 2026-10-05/06)
+## M1 post-mortem (2026-10-05/06)
 
 The first architecture (M1) was a K=8 attention-pooling "thought pool"
 (w_q/w_k/w_v/w_o + gate, r=192) applied to answer slots only, trained by a
 two-pass parallel forward (Pass-A states + Pass-B enriched re-forward) with
-CE warmup -> ST-Gumbel. Terminal verdict across six runs:
+CE warmup -> ST-Gumbel. Across six runs it never beat baseline; the verdicts
+that shaped the redesign:
 
-1. The capitalization bug had two layers: lowercase targets made CE
-   near-impossible (~17-25 nats) and the gate learned the escape hatch
-   (switch itself off, zeroing the W_o gradient); case-sensitive scoring
-   silently zeroed all free-running EM. Both fixed (capitalized targets,
-   case-insensitive scoring).
-2. Gate dynamics need protection on both ends: open-start bias (+2.0, sigmoid
-   ~0.88), lr warmup, and a warmup-only gate floor keep the module alive;
+1. A capitalization bug (lowercase targets + case-sensitive scoring) made CE
+   near-impossible and silently zeroed free-running EM.
+2. Gate dynamics need protection on both ends: open-start bias (+2.0),
+   lr warmup, and a warmup-only gate floor keep the module alive;
    teacher-forced -> free-running transitions re-triggered collapse in every
    run without them.
 3. candle CPU matmuls are not run-to-run deterministic (thread scheduling
-   changes float summation order); fixed seeds do not guarantee
-   reproducible trajectories. Report across 2-3 runs; checkpoints are the
-   safety net.
-4. **Runs 5-6 terminal verdict**: at 131x and 0.1x injection, answer-slot
-   enrichment from last-8 Pass-A states produced **zero** teacher-forced
-   gain. Run 5b learned to *replace* the token identity with
-   W_o(pooled(states)) (~131x the input norm; decoding destroyed — the
-   Finding-6 mechanism, now trained-in); run 6b (gate floor + penalty)
-   equilibrated at the **identity** (bit-exact baseline at inference).
-   Incentive lessons carried forward: **(a) tax the pre-gate injection**
-   (a post-gate tax is dodged by closing the gate), **(b) a magnitude
-   penalty without a floor is escapable; a floor without a tax is a
-   blindfold.**
+   changes float summation order); report across 2-3 runs; checkpoints are
+   the safety net.
+4. At extreme injection (131x / 0.1x), answer-slot enrichment produced zero
+   teacher-forced gain: run 5b learned to *replace* the token identity
+   (the Finding-6 mechanism, now trained-in); run 6b equilibrated at the
+   identity. Incentive lessons carried forward: **(a) tax the pre-gate
+   injection** (a post-gate tax is dodged by closing the gate), **(b) a
+   magnitude penalty without a floor is escapable; a floor without a tax is
+   a blindfold.**
 
 ## Found defect in M1's objective: the CE pairing was self-echo (off-by-one)
 
-Reading the M1 training code closely: `input_ids = [prompt, answer]`,
-`targets = answer`, and the CE paired **logits at position
-`answer_start + i`** with `targets[i] = answer[i]`. But position
-`answer_start + i` *consumes* `answer[i]` as its input — the pairing asked
-the model to re-emit the token it had just consumed, not to predict the
-next one. The correct transition pairing is **logits at
+`input_ids = [prompt, answer]`, `targets = answer`, and the CE paired
+**logits at position `answer_start + i`** with `targets[i]` — but that
+position *consumes* `answer[i]` as its input, so the objective was
+"re-emit the token just consumed" (echo maintenance), not next-token
+prediction. The correct transition pairing is **logits at
 `answer_start - 1 + i` vs `targets[i]`** (the state *before* consuming
 `answer[i]` predicts it).
 
-Consequences, all consistent with the run record:
-
-- The trained objective was "echo maintenance", not answer production;
-  the near-copy solution is almost free for a tied-head LM (loss 17 ->
-  0.7-2.3 without any answer knowledge).
-- The free-running attractors ("KitMilMilMil...") are exactly the trained
-  echo behavior — training and deployment disagreed on the recurrence.
-- Teacher-forced EM converged while free-running EM collapsed: TF-EM
-  measured echo accuracy, FR-EM measured the real (never-trained)
-  transition.
-- The ST phase sampled the token fed at slot `i` from the logits at slot
-  `i` (Pass-A) rather than from slot `i-1` — the same index shift.
-
-The redesign fixes all three: transition-paired CE, sampling from the
-cascade's own previous-step logits, states from the enriched cascade.
+Consequences, all consistent with the run record: the near-copy solution is
+almost free for a tied-head LM (loss 17 -> 0.7-2.3 without answer
+knowledge); the free-running attractors ("KitMilMilMil...") are exactly the
+trained echo; teacher-forced EM converged while free-running EM collapsed
+(TF-EM measured echo accuracy, FR-EM measured the never-trained transition).
+The ST phase had the same index shift. The redesign fixes all three:
+transition-paired CE, sampling from the cascade's own previous-step logits,
+states from the enriched cascade.
 
 ## Redesigned architecture: gated state readout (v2)
 
@@ -114,7 +100,8 @@ x_t     = q_t + g_t * inj_t
   until W moves; the gate only starts learning after the injection exists.
 - Decisions (agreed 2026-10-07): scalar gate; RMS-normalized state; full
   cascade everywhere (training AND inference; parallel prefill is *never*
-  used when the enricher is attached); no auxiliary losses in v0; tau = 8.
+  used when the enricher is attached); no auxiliary losses in v0; tau = 8
+  (superseded by the tau-sweep below: tau = 6).
 
 ## Enricher variants v2.1 (2026-10-08): factored rank-d readout, nonlinearity, content gating
 
@@ -176,20 +163,8 @@ fresh V0, fresh V1/V2/V3-d64 and PCA-r32 checkpoints produce bit-identical
 "Once upon a time" greedy output; old-format (cfg-less) V0 loads; resume
 with a mismatched variant bails with a clear error.
 
-### Variant experiment ladder (claims, 2-3 runs each)
-
-1. **d-sweep (V1 linear)**: rank 64 vs 128 (vs 32 if EM-gain is flat) at
-   the standard smoke recipe — if EM-gain grows monotonically to d=256+,
-   the low-dim-mixture hypothesis is falsified; if d=32-64 saturates, the
-   factored form is the better default.
-2. **V2 (bundle)**: same d with `--train-enrich-act gelu` — free capacity
-   widening; compare against the V1 run at equal d.
-3. **V3 (content gate)**: separate claim after V1/V2 verdicts; watch the
-   u column (open-start ~0.88 via u_b = +2), pregate vs applied divergence.
-4. Calibration note: the KV path carries ~68% of the cross-step gradient
-   (tau-sweep) and is untouched by the paramization — expect modest EM
-   deltas from architecture alone; the ladder's main readout is gradient
-   health (grad norms, pregate band, CE trend) + held-out EM.
+Reference commands (gradient-signature sweep / PCA calibration; the
+overnight form is in Reproduce below):
 
 ```sh
 # fresh variant checkpoint + gradient-signature sweep (no training)
@@ -205,58 +180,22 @@ cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
     --train-skip-eval --train-sweep "4:1" --train-batch 2 \
     --train-enrich-rank 64 --train-enrich-a pca \
     --train-out /tmp/enr_pca64.safetensors
-
-# overnight variant run (recipe identical to v2; tau=6 exact, batch 4 x accum 4)
-cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
-    --train-enricher --train-steps-warmup 600 --train-steps-st 1800 \
-    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
-    --train-enrich-rank 64 --train-enrich-act gelu \
-    --train-out enricher_v21_r64.safetensors
 ```
 
-### d-sweep smoke (2026-10-08): healthy mechanics, d-dependent injection growth
+### d-sweep smoke (2026-10-08): injection growth scales with d
 
 V2 (`--train-enrich-act gelu`) at the v2-1 recipe (tau=4 exact, batch 4 x
 accum 1, 30+30 micros = 60 effective steps, lr ramp 10, lambda 0.1), seeds
-42 / 31337, held-out probe after training (forced-token cascade CE; the
-v2-1 V0 reference on the same protocol: pregate 0.245, applied 0.23/0.35,
-ce 5.14):
-
-| d | seed | pregate | applied p/ans | probe CE | st20 \|g\| |
-|---|------|---------|---------------|----------|------|
-| 32 | 42 | 0.396 | 0.39/0.53 | 6.72 | 10.5 |
-| 32 | 31337 | 0.469 | 0.46/0.55 | 7.26 | 16.2 |
-| 64 | 42 | **1.292** | 1.26/1.72 | 9.94 | 18.7 |
-| 64 | 31337 | **0.850** | 0.83/1.05 | 5.41 | 24.8 |
-| 128 | 42 | **1.543** | 1.49/1.95 | 4.87 | 19.9 |
-| 128 | 31337 | **1.436** | 1.41/1.68 | 5.40 | 18.5 |
-
-Findings:
-
-1. **Injection growth rate scales with d, reproducibly**: probe pregate
-   0.40-0.47 (d32) < 0.85-1.29 (d64) < 1.44-1.54 (d128); V0 grew slowest
-   of all (0.245) despite the largest init gradient (16.4 vs 3.2 for d64's
-   B). The bottleneck converts gradient into injection *faster* — fewer,
-   better-aligned directions compose under Adam sooner.
-2. **The tax calibration is d-dependent**: lambda 0.1 was tuned on V0's
-   growth rate and under-brakes d >= 64, which exits the 0.25-1x band
-   within 60 steps in both seeds. No aborts fired (the band check is
-   monitoring-only); add a lambda 0.2-0.3 recalibration for d >= 64 or an
-   explicit pregate-band warning/abort in the training loop.
-3. **60-step probe CE cannot rank capacity**: means 6.99 / 7.68 / 5.14
-   (d32/d64/d128), non-monotone with huge seed spread (d64: 9.94 vs
-   5.41). Gradient noise (<= 32 loss tokens) dominates at this horizon.
-   d128-s42 even beat the fresh baseline CE (5.09) — but at 1.5-1.9x
-   applied injection, the regime where TF-CE gains flatter over-injection
-   and need free-running EM to confirm (the M1 lesson).
-4. **Mechanics held everywhere**: gate 0.99 flat, no collapse, no abort,
-   RSS ~5 GB (batch 4, tau=4), ~9.5 min per run + ~1 min probe.
-
-Next-run consequences: overnight capacity runs (600+1800, tau=6 exact,
-batch 4 x accum 4) should use d=32 lambda=0.1 as-is, and d=64/128 only
-after a 10-min lambda=0.3 calibration smoke confirms pregate <= 1x at 60
-steps. Free-running EM + bench transfer, not probe CE, are the verdict
-metrics.
+42 / 31337. Probe pregate grew 0.40-0.47 (d32) < 0.85-1.29 (d64) <
+1.44-1.54 (d128) — reproducibly d-dependent (V0 grew slowest of all, 0.245,
+despite the largest init gradient): the bottleneck converts gradient into
+injection *faster* — fewer, better-aligned directions compose under Adam
+sooner. Consequence: **lambda 0.1 (tuned on V0) under-brakes d >= 64**,
+which exits the 0.25-1x band within 60 steps in both seeds. 60-step probe
+CE could not rank capacity (means 6.99 / 7.68 / 5.14 for d32/64/128,
+non-monotone with huge seed spread — gradient noise dominates at this
+horizon). Mechanics held everywhere: gate 0.99 flat, no collapse, no abort,
+RSS ~5 GB, ~9.5 min per run.
 
 ### Lambda calibration smokes (2026-10-08): lambda 1.0 is the factored-variant brake
 
@@ -270,21 +209,13 @@ CE after 60 effective steps; baseline ~5.09):
 | 128 | 42 | 1.543 | 0.967 | **0.586** | 4.87 | 4.68 | **3.32** |
 | 128 | 31337 | 1.436 | 0.816 | — | 5.40 | 4.54 | — |
 
-Findings:
-
-1. **lambda 0.3 barely brakes d64** (1.292 -> 1.301 on s42) — consistent
-   with AdamW's per-entry normalization: when the tax gradient is
-   sub-dominant in magnitude *and* rarely flips an entry's sign balance,
-   scaling it 3x changes little. lambda 1.0 does bite (0.62, in band).
-2. **lambda 1.0 improved CE instead of crushing it**: d128/s42 probe CE
-   3.32 (baseline 5.09), in-train ST loss *declines* through the forcing
-   anneal (st20 4.85 vs 5.81 at lambda 0.1 and 7.3-8.9 for the rest of
-   the matrix). Restrained injection looks better-conditioned, not
-   starved. Caveats stand: probe CE is teacher-forced (~40 rows), 60-step
-   horizon — free-running EM remains the verdict.
-3. Calibration verdict: **lambda = 1.0 for the factored variants at
-   d >= 64**; d=32 stays at lambda 0.1 (its lambda-0.1 dynamics were
-   already in band; lambda 1.0 untested at d32).
+Verdict: **lambda = 1.0 for the factored variants at d >= 64**; d=32 stays
+at lambda 0.1 (its lambda-0.1 dynamics were already in band; lambda 1.0
+untested at d32). lambda 1.0 *improved* CE instead of crushing it (d128/s42
+probe CE 3.32, in-train ST loss declining through the anneal) — restrained
+injection looks better-conditioned, not starved. Caveats: probe CE is
+teacher-forced (~40 rows), 60-step horizon — free-running EM remains the
+verdict metric.
 
 ## Claim R — the thought-residual (2026-10-08): pick-orthogonal readout source
 
@@ -406,42 +337,22 @@ residual pick:           shat_r = rmsnorm(shat − alpha·q_t);    the thought-r
 - Zero-init property preserved trivially: at W/B = 0 the injection is 0
   regardless of the readout source (bit-exact baseline regression).
 
-### Claim-R run protocol (matches the lambda-1.0 smoke recipe)
-
-Short smokes identical in shape to the cal10 lambda-1.0 runs (tau=4 exact,
-batch 4 x accum 1, 30+30 micros = 60 effective steps, lr ramp 10, lambda
-1.0; matrix d64 s42, d128 s42) plus the held-out probe; the cal10 runs are
-the paired controls. Fresh-init signature sweep first (both modes). Long-run
-consequences deferred until the smokes read out.
-
-```sh
-# d64 (then d128); ~11 min per run + ~1 min probe, matching cal10
-cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
-    --train-enricher --train-steps-warmup 30 --train-steps-st 30 \
-    --train-lr-warmup 10 --train-tau 4 --train-batch 4 --train-accum 1 \
-    --train-inj-l2 1.0 --train-seed 42 \
-    --train-enrich-rank 64 --train-enrich-act gelu --train-enrich-residual pick \
-    --train-skip-eval --train-out /tmp/opencode/res_d64_s42.safetensors
-
-cargo run --release -- --cpu --model-dir models/gemma-3-270m-it \
-    --train-enricher --train-probe \
-    --train-out /tmp/opencode/res_d64_s42.safetensors
-```
-
 ### Claim-R smokes (2026-10-08): healthy mechanics, d64-pick carries on both seeds
 
-Verification first (all passed): fresh residual-pick signature b 3.247 vs
-none 3.175 (recorded 3.18) — wakeup intact, a/gate 0.000; fresh-pick
-generation bit-identical to baseline; legacy 4-slot cfg loads (alpha/rem
-NaN); resume mismatch bails; fresh-pick held-out probe ce == fresh-none ce
-(4.274 — the doc's earlier 5.09 predates the held-out dedup redraw).
-alpha stats: mean |alpha| ~ 0.11-0.13, mean removed fraction ~ 2% — stable
-across warmup/ST/probe, both ranks, both seeds (a property of the frozen
-states, weakly affected by the injection). No degenerate hits anywhere.
-
-Full matrix (cal10 recipe ± the residual flag; lambda 1.0; d64/d128 x
-seed 42/31337; probe = held-out forced CE after 60 effective steps, fresh
-baseline 4.274):
+Protocol: short smokes identical in shape to the calibration lambda-1.0
+runs (tau=4 exact, batch 4 x accum 1, 30+30 micros = 60 effective steps,
+lr ramp 10, lambda 1.0; matrix d64/d128 x seed 42/31337, ± the residual
+flag) plus the held-out probe; the calibration runs are the paired controls.
+Fresh-init signature b 3.247 (pick) vs 3.175 (none) — wakeup intact,
+a/gate 0.000; fresh-pick generation bit-identical to baseline; legacy
+4-slot cfg loads; resume mismatch bails; fresh-pick held-out probe ce ==
+fresh-none ce (4.274 — the earlier 5.09 predates the held-out dedup
+redraw). alpha stats: mean |alpha| ~ 0.11-0.13, mean removed fraction ~ 2%
+— stable across warmup/ST/probe, both ranks, both seeds (a property of the
+frozen states, weakly affected by the injection). No degenerate hits
+anywhere. Mechanics replicated: gate 0.98-0.99 flat, pregate in band,
+~10.7 min/run (the residual op is free); the residual mildly brakes
+injection growth (pick pregate <= none in 3 of 4 cells).
 
 | d | seed | none pregate | pick pregate | none CE | pick CE | CE delta |
 |---|------|------|------|------|------|------|
@@ -450,145 +361,70 @@ baseline 4.274):
 | 128 | 42 | 0.586 | 0.384 | 3.319 | 4.168 | +0.85 |
 | 128 | 31337 | 0.382 | 0.416 | 4.327 | 3.414 | −0.91 |
 
-Findings:
-
-1. **Mechanics replicated**: gate 0.98-0.99 flat everywhere, pregate in
-   band, no degen hits, ~10.7 min/run (wall time unchanged — the residual
-   op is free). The residual mildly brakes injection growth (pick pregate
-   <= none pregate in 3 of 4 cells).
-2. **d64-pick carries on both seeds** (−1.08, −0.39; means −0.73): the only
-   cell with a consistent directional signal. Its pick seed spread is also
-   the tightest in the matrix (4.890 vs 4.820 — 0.07 nats vs 0.76-1.01
-   elsewhere; 2 points per cell, weak but notable).
-3. **d128 is a coin flip** (+0.85, −0.91): seed noise dominates the rank at
-   d128; no verdict.
-4. Trained-60-step modules sit at or above the fresh-baseline probe CE
-   (4.274) in most cells — the known TF-CE-flattering-over-injection
-   regime; free-running EM remains the verdict metric.
-
 Verdict: no Claim-R decision at the smoke horizon (probe CE is
-teacher-forced and 60 steps is noise-ruled). The candidate for the
-overnight pair is **d64, pick vs none** — it is the cell whose effect
-survived seed replication. d128 drops (inconclusive + 2x probe CE seed
-spread); only its residual mode is carried, as an exploratory cell.
+teacher-forced and 60 steps is noise-ruled). **d64, pick vs none** is the
+only cell with a consistent directional signal (−1.08, −0.39) and the
+tightest seed spread — it became the overnight candidate; d128 is a coin
+flip (seed noise dominates the rank; only its residual mode carried as an
+exploratory cell).
 
-### Claim-R overnight configs (documented 2026-10-08; runs 1-2 done 2026-10-10/11, d128 pending)
+### Claim-R overnights (2026-10-10/11)
 
-Three runs, the doc's overnight recipe (tau=6 exact KV, batch 4 x accum 4,
-600 + 1800 micros = 600 effective steps ~ 8 h each, lr ramp 50 default,
-lambda 1.0 per the factored-variant calibration verdict), explicit seeds;
-second-seed replication = the same command with `--train-seed 42`. Night
-watch list unchanged (gate < 0.05 abort, pregate > 1, applied p/ans
-divergence, RSS ~4-5 GB) plus the new columns: alpha should stay ~0.11-0.13
-(rem ~2%) — a drift there is a state-distribution warning, not a module
-failure; degen > 0 = collapse signature.
+Three runs at the doc's overnight recipe (tau=6 exact KV, batch 4 x accum
+4, 600 + 1800 micros = 600 effective steps ~ 8 h each, lr ramp 50 default,
+lambda 1.0 per the calibration verdict): (1) d64 none control — doubles as
+the never-run v2.1 d64 overnight; (2) d64 pick (the Claim-R candidate);
+(3) d128 pick, exploratory (dropped after the smokes: seed sign-flip).
+Watch list beyond the standard: alpha should stay ~0.11-0.13 (rem ~2%) —
+a drift there is a state-distribution warning, not a module failure;
+degen > 0 = collapse signature. Full commands in Reproduce below.
 
-```sh
-# 1. d64 control (none) — doubles as the never-run v2.1 d64 overnight,
-#    pinned to lambda 1.0 (the v2.1 suggestion predated the calibration
-#    verdict and carried the under-braked default 0.1)
-cargo run --release -- --cpu --train-enricher \
-    --model-dir models/gemma-3-270m-it \
-    --train-steps-warmup 600 --train-steps-st 1800 \
-    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
-    --train-inj-l2 1.0 --train-seed 31337 \
-    --train-enrich-rank 64 --train-enrich-act gelu \
-    --train-out enricher_r_d64_none.safetensors
+#### Run 2 (d64 pick, 2026-10-10): clean mechanics, real forced-mode signal, free-running + transfer destroyed
 
-# 2. d64 pick (the Claim-R candidate)
-cargo run --release -- --cpu --train-enricher \
-    --model-dir models/gemma-3-270m-it \
-    --train-steps-warmup 600 --train-steps-st 1800 \
-    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
-    --train-inj-l2 1.0 --train-seed 31337 \
-    --train-enrich-rank 64 --train-enrich-act gelu --train-enrich-residual pick \
-    --train-out enricher_r_d64_pick.safetensors
+~6.5 h (74 checkpoints, zero aborts, atomic saves — tmp + rename, a
+mid-write kill cannot corrupt the last good checkpoint). Mechanically clean:
+gate 0.94 -> 0.998 flat (floor annealed away without sag), alpha/rem/degen
+in band all night, RSS ~7.0 GB steady (above the 4-5 GB estimate; watch
+item). Pregate 0.03-0.06 — never entered the 0.25-1x band: the lambda-1.0
+tax plus the ST lr held injection small all night. Applied p/ans ended
+~0.05/0.4 — answer-slot-concentrated with prompt-side starved (the KV-path
+credit did not materialize at this scale). No ST-entry shock (p_forced
+anneals over 1800 micros).
 
-# 3. d128 pick (exploratory; d128-none dropped — seed sign-flip in the smokes)
-cargo run --release -- --cpu --train-enricher \
-    --model-dir models/gemma-3-270m-it \
-    --train-steps-warmup 600 --train-steps-st 1800 \
-    --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
-    --train-inj-l2 1.0 --train-seed 31337 \
-    --train-enrich-rank 128 --train-enrich-act gelu --train-enrich-residual pick \
-    --train-out enricher_r_d128_pick.safetensors
-```
-
-Verdict metrics after the overnights: the standard battery (held-out EM,
-free-running greedy EM + guided-first, digits/trivia bench transfer) —
-free-running EM, not probe CE, decides Claim R; findings then land in
-FEEDBACK.md.
-
-### Claim-R overnight run 2 (d64 pick, 2026-10-10): clean mechanics, real forced-mode signal, free-running + transfer destroyed
-
-Run #2 (seed 31337): ~6.5 h (600 + 1800 micros at ~9.4 s/micro), 74 checkpoints
-at the 5-min cadence (saves now atomic — tmp + rename, a mid-write kill cannot
-corrupt the last good checkpoint), zero aborts. Trajectory mechanically clean
-everywhere: gate 0.94 -> 0.998 flat (the floor annealed away without sag),
-alpha 0.120-0.130 / rem 0.022-0.027 / degen 0 all night (expected band), RSS
-~7.0 GB steady (above the 4-5 GB estimate; watch item). Pregate 0.03-0.06 —
-never entered the 0.25-1x band: the lambda-1.0 tax plus the ST lr held
-injection small all night. Applied p/ans ended ~0.05/0.4 — answer-slot-
-concentrated with prompt-side starved (doc risk #1: prompt-side gets no credit
-beyond the tau window; the KV-path credit did not materialize at this scale).
-CE ~0.8-1.0 stable through the forcing anneal; no ST-entry shock (p_forced
-anneals over 1800 micros, so the v2-1-style bump is smeared across the first
-few hundred steps).
-
-Held-out (100 examples):
-
-| metric | baseline | trained |
+| metric (100 held-out) | baseline | trained |
 |---|---|---|
 | teacher-forced EM | 37.9% | **65.8%** |
 | free-running EM | 26.5% | 26.0% |
 | FR, first-token-guided | 86.5% | **57.0%** |
 
-Probe (trained checkpoint, held-out): gate 0.998 | pregate 0.085 | applied
+Probe (trained, held-out): gate 0.998 | pregate 0.085 | applied
 0.056/0.634 | ce 2.185 (fresh baseline 4.274) — the forced-mode signal is
 real.
 
 Bench transfer (digits-20 n=100, trivia n=40; enricher mode = cascade
-everywhere):
-
-| task | baseline | enricher | p |
-|---|---|---|---|
-| digits-20 | 100% | **0%** | 0.000 |
-| trivia | 72% | **2%** | 0.000 |
+everywhere): digits-20 100% -> **0%** (p=0.000), trivia 72% -> **2%**
+(p=0.000).
 
 Findings:
 
-1. **The pick-readout learns a usable state summary under forcing**: TF-EM
-   +28 points, probe CE halved (2.19 vs 4.27) — the smoke's d64-pick CE wins
-   carry to overnight scale.
-2. **Zero free-running transfer, plus active destabilization**: FR-EM flat
-   (-0.5); guided-first drops 29.5 points — with a correct first token the
-   trained cascade derails continuations, and the trained-guided misses are
-   name-blend attractors ("Kitu", "Milorp" — echo texture). Small per-step
-   injections compound over self-generated states: the
-   TF-CE-flatters-over-injection regime, now at tiny injection scale.
-3. **Off-task the module is catastrophic**: digits 100 -> 0%, trivia 72 ->
-   2%. Diagnostic (2026-10-10): a FRESH identity enricher of the same variant
-   on digits-20 scores 100% (p=1.000, token counts identical) — the
-   cascade-prefill bench path is bit-exact at B=0, so **the trained weights
-   alone** cause the collapse. The enricher mode perturbs every prompt
-   position (~90 injections accumulate in the KV before the answer), and the
-   module only ever saw state-track/induce-d states: off-distribution, its
-   injections are poison.
-4. **No Claim-R verdict** — this is half the pair. The d64-none control
-   (run #1) is required to attribute both the guided-first destabilization and
-   the transfer collapse to the residual treatment vs the v2 recipe itself.
-   d128-pick (run #3) and the tau-8 revisit defer until the control reads out.
-5. **Option (c) aux local CE is now triggered**: its deferral condition was
-   "add only if the cross-step grad share shows prompt-side learning is
-   starved" — applied p/ans 0.05/0.4 with prompt-side flat all night is
-   exactly that signal.
+1. The pick-readout learns a usable state summary under forcing: TF-EM
+   +28 points, probe CE halved — the smoke CE wins carry to overnight scale.
+2. Zero free-running transfer plus active destabilization: guided-first
+   drops 29.5 points — with a correct first token the trained cascade
+   derails continuations (name-blend attractors, "Kitu"/"Milorp" echo
+   texture). Small per-step injections compound over self-generated states:
+   the TF-CE-flatters-over-injection regime, now at tiny injection scale.
+3. Off-task the module is catastrophic — diagnosed (2026-10-10) below: the
+   trained weights alone cause the collapse.
+4. Aux local CE (option (c)) triggered: its deferral condition was "add only
+   if prompt-side learning is starved" — applied p/ans 0.05/0.4 with
+   prompt-side flat all night is exactly that signal.
 
-### Fresh-identity bench diagnostic (2026-10-10): the trained weights are the poison, not the cascade path
+#### Fresh-identity bench diagnostic (2026-10-10): the trained weights are the poison, not the cascade path
 
 A fresh identity enricher of the same variant (rank 64, gelu, pick, seed
-31337; built by the 0-step sweep recipe, fresh-init signature b 3.247 —
-matches the recorded fresh-pick signature) run through the identical bench
-invocation, digits-20 n=100:
+31337; 0-step sweep recipe, fresh-init signature b 3.247) through the
+identical bench invocation, digits-20 n=100:
 
 | | digits-20 |
 |---|---|
@@ -601,29 +437,24 @@ alone cause the off-task collapse** (and, by extension, the guided-first
 destabilization). Interpretation: the module only ever saw state-track /
 induce-d state distributions; off-distribution its per-step injections are
 poison, and the bench mode applies ~90 of them over the prompt before the
-answer. Consequence for the eval battery: the fresh-identity bench row is the
-cheap control that separates "path damage" from "weight damage" — run it
-whenever an enricher bench row collapses.
+answer. Eval-battery lesson: **the fresh-identity bench row is the cheap
+control that separates "path damage" from "weight damage" — run it whenever
+an enricher bench row collapses.**
 
-### Claim-R overnight run 1 (d64 none control, 2026-10-11): recipe-wide damage confirmed — pick is the milder failure
+#### Run 1 (d64 none control, 2026-10-11): recipe-wide damage confirmed — pick is the milder failure
 
-Run #1 executed at a DEVIATED split: 300 warmup + 2100 ST (same 2400-micro
-total; the warmup->ST reallocation was a deliberate second variable, so the
+Executed at a DEVIATED split: 300 warmup + 2100 ST (same 2400-micro total;
+the warmup->ST reallocation was a deliberate second variable, so the
 pick-vs-none attribution is confounded — accepted before launch). ~6.1 h
-train + eval (the 14 h wall gap was machine suspension), 0 aborts, mechanics
-clean (gate 0.995-0.998 flat, no collapse, RSS ~7.0 GB).
+train + eval, 0 aborts, mechanics clean (gate 0.995-0.998 flat, RSS ~7.0
+GB). The none readout injects far more aggressively than pick: pregate 0.23
+by ST 0 (pick never left 0.03-0.06), applied answer-side climbing to
+**1.0-1.65x input energy in the late anneal** (the watch-list takeover
+line, crossed on the applied side; pregate stayed <= 0.23). The fully
+on-policy tail showed instability spikes (st 2060-2070: CE 4.6, |g| 34-53)
+— the compounding loop visible in training itself.
 
-Trajectory differences vs run 2 (pick): the none readout injects far more
-aggressively — pregate 0.23 by ST 0 (pick never left 0.03-0.06), applied
-answer-side climbing to **1.0-1.65x input energy in the late anneal** (the
-watch-list takeover line, crossed on the applied side; pregate itself stayed
-<= 0.23). Held-out probe: applied 0.079/**1.579**, ce 2.520 (pick 0.634,
-2.185). The fully-on-policy tail showed instability spikes (st 2060-2070:
-CE 4.6, |g| 34-53) — the compounding loop visible in training itself.
-
-Verdict metrics (100 held-out; pick numbers in parens):
-
-| metric | baseline | none (pick) |
+| metric (100 held-out) | baseline | none (pick) |
 |---|---|---|
 | teacher-forced EM | 37.9% | 59.1% (65.8%) |
 | free-running EM | 26.5% | **15.5%** (26.0%) |
@@ -634,15 +465,13 @@ Verdict metrics (100 held-out; pick numbers in parens):
 Findings:
 
 1. **The damage is v2-recipe-wide, not Claim-R-specific**: the none control
-   collapses off-task (digits 0%, trivia 5%) and destabilizes free-running
-   (FR -11, guided -47 vs baseline) — the same failure class as pick, only
-   worse. The residual treatment is exonerated as the special culprit.
+   collapses off-task and destabilizes free-running — the same failure
+   class as pick, only worse. The residual treatment is exonerated as the
+   special culprit.
 2. **Pick was the milder failure on every deployment metric** while matching
    the TF gain (65.8 vs 59.1): the pick-orthogonalization demonstrably brakes
    injection growth at scale (3-5x less energy, applied never left ~0.5x vs
-   none's 1.6x) — Claim R's anti-echo mechanism measurably works, and the
-   smoke's "pick pregate <= none" hint holds at overnight scale with a wide
-   margin.
+   none's 1.6x) — Claim R's anti-echo mechanism measurably works.
 3. **The split did not rescue free-running** (none@300+2100 is worse than
    pick@600+1800): more on-policy exposure at the current guards lets the
    injection grow into the takeover band instead of stabilizing deployment.
@@ -650,11 +479,11 @@ Findings:
    the qualitative conclusion (recipe-wide damage) does not depend on it.
 4. **The central blocker is now the paradigm, not the variant**: per-step
    injection helps only the forced training tasks and poisons everything
-   else. Doc levers next: (c) aux local CE (triggered, see run-2 finding 5)
-   for prompt-side credit; bench-informed state coverage (the module never
-   saw off-task state distributions); an applied-energy cap given the gate
-   never closes (0.998) — note the M1 post-gate-tax objection assumed the
-   gate could close, which it demonstrably does not here.
+   else. Doc levers next: (c) aux local CE (triggered, run-2 finding 4) for
+   prompt-side credit; bench-informed state coverage (the module never saw
+   off-task state distributions); an applied-energy cap given the gate never
+   closes (0.998) — note the M1 post-gate-tax objection assumed the gate
+   could close, which it demonstrably does not here.
 
 ## Training as RNN BPTT
 
@@ -781,7 +610,8 @@ Memory levers (measured 2026-10-07, per-process peaks):
   noise — use only if noise demonstrably dominates. NOTE: `--train-steps-*`
   count **micro-steps**; the default 150+300 micros = 112 effective steps ~
   **1.6-1.9 h**. For a full night at the default recipe scale up (e.g.
-  600 warmup + 1800 ST micros = 600 effective steps ~ 8 h).
+  600 warmup + 1800 ST micros = 600 effective steps ~ 8 h; ~2.5-3k micros
+  ~ 7-10 h).
 
 Options considered:
 
@@ -794,7 +624,8 @@ Options considered:
 - **(c) Hierarchical local losses** — aux next-token CE at every m-th
   position (frozen head, weight ~0.05-0.1): gives prompt-side injections
   local credit beyond the tau horizon. Deferred (agreed): add only if the
-  cross-step grad share shows prompt-side learning is starved.
+  cross-step grad share shows prompt-side learning is starved —
+  **triggered by overnight run 2** (see finding 4 there).
 - **(d) DEQ / implicit differentiation** — unnecessary: finite
   single-state recurrence, weakly contractive, explicit. Equilibrium
   machinery pays off only for iterate-to-fixed-point schemes.
@@ -811,7 +642,8 @@ Phases (each gates the next):
 1. **Gradient sanity** (single example): cascade forward, loss decreases,
    grads only on `enrich.*`, per-tensor grad norms, tau-sweep, measured c.
 2. **CE warmup** (~150 steps, forced targets): still warranted — cold-start
-   loss 14-17 nats and the W-only wakeup stage needs stable states.
+   loss ~4.4 nats (the M1 14-17 was the echo objective's inflation) and the
+   W-only wakeup stage needs stable states.
 3. **Hard-sampled ST phase** (~300 steps): at each answer slot, with
    probability p_forced (annealed 1 -> 0 across the phase) feed the target
    token, else sample hard from softmax(logits_{t-1} / gt), gt annealed
@@ -821,63 +653,49 @@ Phases (each gates the next):
 4. **Evaluation**: teacher-forced EM (transition-paired argmax) +
    free-running greedy EM (cascade prefill) + guided-first variant
    (separates first-step bootstrap from destabilization) + bench transfer
-   (digits/trivia unharmed).
-5. Optional later: aux local CE; elementwise gate; REINFORCE/GRPO (M3).
+   (digits/trivia unharmed) + the fresh-identity bench control (see the
+   diagnostic above).
+5. Optional later: aux local CE (triggered, see overnight run 2); elementwise
+   gate; REINFORCE/GRPO (M3).
 
 Kept guards: gate bias +2 open-start (default), lr warmup (50 steps),
 warmup-only gate floor 0.5 with ST-phase anneal, gate-collapse detector
-(auto-abort + forensic checkpoint), 30-min checkpoints, 2-3 runs per claim
+(auto-abort + forensic checkpoint), 5-min checkpoints, 2-3 runs per claim
 (CPU non-determinism).
 
 **Injection penalty (pre-gate)**: `loss + lambda * mean(||W shat||^2 /
-||q||^2)`, lambda = 0.1 — the M1 lesson (a): the tax is on the pre-gate
-injection so closing the gate cannot dodge it. Healthy band 0.25-1x
-relative injection energy; also serves as the BPTT well-conditioning
-(bounds c). Monitor both pre-gate and applied (post-gate) ratios.
+||q||^2)` — the M1 lesson (a): the tax is on the pre-gate injection so
+closing the gate cannot dodge it. Healthy band 0.25-1x relative injection
+energy; also serves as the BPTT well-conditioning (bounds c). Monitor both
+pre-gate and applied (post-gate) ratios. lambda is **d-dependent** — the
+calibration verdict above: 0.1 for d=32 / V0 full-rank, 1.0 for the
+factored variants at d >= 64.
 
-## Run v2-1 (2026-10-07): first dynamics smoke — healthy on every axis
+**Overnight watch list**: gate < 0.05 (auto-abort + forensic dump fires),
+pregate > 1 (takeover watch; lambda can be raised), applied p/ans
+divergence, CE trend through the forcing anneal, RSS in `top` (expect
+~4-5 GB steady at batch 4; ~7 GB measured on the overnights), and for
+residual runs alpha ~0.11-0.13 / rem ~2% / degen 0.
 
-Config: tau=4 exact, batch 4 x accum 1 (60 real optimizer steps), warmup 30
-+ ST 30 micros, lr ramp 10, gate bias +2 / floor 0.5, inj_l2 0.1, seed 42,
-~9.5 min wall, fresh W=0 start.
+### First dynamics smoke (run v2-1, 2026-10-07): healthy on every axis
 
-Trajectory (warmup -> ST):
+tau=4 exact, batch 4 x accum 1 (60 effective steps), warmup 30 + ST 30
+micros, lr ramp 10, gate bias +2 / floor 0.5, inj_l2 0.1, seed 42, ~9.5
+min. Readings that mattered:
 
-| metric | warmup 0 | warmup 10 | warmup 20 | st 0 | st 10 | st 20 |
-|---|---|---|---|---|---|---|
-| ce | 4.42 | 3.78 | 4.11 | 7.58 | 5.96 | 5.40 |
-| gate | 0.940 | 0.949 | 0.974 | 0.980 | 0.980 | 0.982 |
-| pregate | 0.000 | 0.008 | 0.056 | 0.116 | 0.163 | 0.213 |
-| applied p/ans | 0/0 | — | — | 0.132/0.281 | 0.169/0.271 | 0.215/0.349 |
-| \|g\| | 17.7 | 33.4 | 46.0 | 40.4 | 40.8 | 25.3 |
-
-Probe (held-out, fresh pass, after training): gate 0.987 | pregate 0.245 |
-applied 0.233/0.353 | ce 5.14.
-
-Readings:
-
-1. **Cold start ~4.4 nats, not M1's 17**: at W=0 the transition-paired CE is
-   the frozen model's natural answer uncertainty; the M1 echo objective had
-   inflated it. ST entry bump (7.6) is the on-policy sampled tokens — it
-   *declines* (-> 5.4) while scheduled forcing anneals 1 -> 0.33.
-2. **No gate collapse anywhere** (0.94 -> 0.98 flat): the run-2/run-4
-   collapse pattern did not reproduce with hard-sampled tokens + scheduled
-   forcing + open-start bias + floor. The auto-abort never fired.
-3. **No injection takeover**: pregate grows monotonically-slowly (0 ->
-   0.245 over 60 steps) inside the lower healthy band; M1's failure was
-   131x — here ~0.25x and the pre-gate tax is active.
-4. **Rising \|g\| during warmup (17.7 -> 46) is the designed cross-step
-   wakeup signature**: at W=0 only the immediate path exists; as W grows
-   the state-chain turns on and adds gradient mass. \|g\| then declines at
-   ST (25) as the loss stabilizes.
-5. **Prompt-side writes earn credit**: applied p/ans ~ 0.23/0.35 — writes
-   concentrate at answer slots (~1.5x) but prompt positions are far from
-   zero. This is the KV-path credit the M1 answer-only design could never
-   get.
-6. **tau=4 is too short for long-answer buckets**: the
-   `tau=4 < answer_len+1=5` warning fired on buckets with 4-token answers
-   (the first transition's immediate gradient falls outside the window).
-   tau=6 (the default) covers them exactly — tau=4 is speed-smoke only.
+- Cold start ~4.4 nats (not M1's 17 — that was the echo objective's
+  inflation); the ST-entry bump (7.6) is the on-policy sampled tokens and
+  *declines* (-> 5.4) while scheduled forcing anneals.
+- No gate collapse anywhere (0.94 -> 0.98 flat); the auto-abort never
+  fired.
+- No injection takeover: pregate grows monotonically-slowly (0 -> 0.245
+  over 60 steps) inside the lower healthy band.
+- Rising |g| during warmup (17.7 -> 46) is the designed cross-step wakeup
+  signature; declines at ST (25) as the loss stabilizes.
+- Prompt-side writes earn credit (applied p/ans ~ 0.23/0.35) — the KV-path
+  credit the M1 answer-only design could never get.
+- tau=4 is speed-smoke only (too short for 4-token answer buckets); tau=6
+  (the default) covers them exactly.
 
 ## Inference integration
 
@@ -913,105 +731,39 @@ sequential split left ~3% of held-out state-track prompts as literal
 training prompts (the distinct-prompt space is only ~1e5 for state-track;
 induce-d was already collision-free).
 
-Bench relation (corrected 2026-10-08): the original bench `induce` is an
-IN-FAMILY validation of the induce-d skill, not an independent transfer
-measure — same statement/query format, 15/16 vocab overlap with the
-training pool, and ~8x coverage of every (word -> number) pair across
-training prompts (unexploitable: the mapping is random per example, so no
-consistent association exists to memorize; the answer always derives from
-the prompt's own context). Moreover its statements are NOT shuffled, so
-the queried pair is always the last stated one — solvable by echoing the
-last number with zero word->number binding (verified 400/400 rows in
-bench_results.csv; see the bench-validity note in FEEDBACK.md). The
-binding-honest bench variants are `induce-sh` (statements shuffled) and
-`induce-early` (query drawn from positions 0..4, never last-drawn;
-statements shuffled). digits/trivia remain clean transfer measures.
+Bench validity: the original bench `induce` is an in-family validation of
+induce-d, not independent transfer — its statements are NOT shuffled, so
+it is solvable by echoing the last stated number. Use the binding-honest
+variants `induce-sh` / `induce-early`; details in the bench-validity note
+in FEEDBACK.md. digits/trivia remain clean transfer measures.
 
-## Compute reality and execution plan
+## Compute reality
 
 Environment: 8-core CPU, 14 GB RAM, F32 safetensors backend only (GGUF
 cannot train). Default recipe **tau=6 exact, batch 4, accum 4** (effective
 batch 16): ~12 s/micro-step, ~3.5-4 GB peak. The default 150+300
 micro-steps run ~1.6-1.9 h (112 effective steps); scale `--train-steps-*`
-for a full night (micro-steps ~2.5-3k ~ 8-10 h). Unattended runs with
-5-min checkpoints (user-approved).
-
-1. ~~M1 module + runs 1-6~~ (done; post-mortem above).
-2. **This redesign**: enrich.rs v2 + cascade inference path + cascade
-   training (TBPTT tau=6 exact) + transition-paired CE/eval + regression
-   battery (done: no-enricher == fresh-enricher bit-identical, F32 + GGUF).
-3. ~~Gradient sanity + tau-sweep~~ (done 2026-10-07: table above; tau=6
-   exact chosen; embedding/head removed from the graph; accumulation
-   implemented; per-tensor norms labeled + foreign-grad check).
-4. ~~Data calibration smoke~~ (superseded by run v2-1: baseline CE ~4.4
-   nats, held-out 5.1; the old echo-pairing numbers are obsolete).
-5. ~~Short CE + ST run~~ (done: run v2-1 above — healthy dynamics, no
-   collapse, no takeover; injection at the lower band edge after 60 steps).
-6. Overnight full run (scale --train-steps-* to the night budget;
-   checkpoints every ~5 min).
-7. Evaluation: bench `enricher` mode (cascade) vs baseline; held-out EM;
-   findings into FEEDBACK.md; commit.
-
-### Next-run suggestions
-
-- **Recommended overnight** (tau=6 exact, batch 4 x accum 4, ~8 h, 600
-  effective steps):
-  ```sh
-  cargo run --release -- --cpu --train-enricher \
-      --model-dir models/gemma-3-270m-it \
-      --train-steps-warmup 600 --train-steps-st 1800 \
-      --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
-      --train-out enricher_v2.safetensors
-  ```
-  (lr ramp 50 default; gate-bias/floor/inj defaults already match.)
-- **Medium smoke first** (~40 min, optional): same but
-  `--train-steps-warmup 150 --train-steps-st 150 --train-accum 1` — verify
-  injection climbs through the 0.25-1x band and CE keeps declining before
-  committing the night.
-- **Night watch list**: gate < 0.05 (auto-abort + forensic dump fires),
-  pregate > 1 (takeover watch; lambda can be raised), applied p/ans
-  divergence, CE trend through the forcing anneal, RSS in `top` (expect
-  ~4-5 GB steady).
-- **accum 8/16** only if the loss curve looks noise-dominated (wall time
-  ~2x/4x per effective step).
-- **tau revisit**: if after the night the answer-slot injections dominate
-  and prompt-side stays near zero, the 5-8 KV window was the missing
-  credit — try batch 4 x accum 8 with `--train-tau 8` (~2x wall time).
-
-### Success criteria
-
-- Held-out EM >= baseline + 5 points on trained tasks, gate demonstrably
-  active (nonzero injection on non-trivial steps), free-running stable.
-- Digits/trivia unharmed (bench transfer check).
-- Gradient diagnostics consistent with the c < 1 contraction model
-  (tau-sweep agreement >= 99%).
-
-### Risks and mitigations
-
-- Answer-slot-bias shortcut: early gradient is purely immediate; if that
-  alone moves EM, pressure to grow cross-step paths may be weak. Watch the
-  cross-step grad share; mitigation: aux local losses (option c).
-- Injection takeover (run-5b): pre-gate tax + collapse detector + penalty
-  band monitoring.
-- Gate collapse at ST entry: scheduled forcing + annealed floor.
-- CPU non-determinism: 2-3 runs per claim; checkpoints.
-- Training throughput worse than estimated: batch-1 grad-accum fallback;
-  shorter prompts.
+for a full night (600+1800 ~ 8 h; ~2.5-3k micros ~ 7-10 h). Unattended
+runs with 5-min checkpoints.
 
 ## Reproduce
 
 ```sh
-# default overnight recipe (tau=6 exact, batch 4 x accum 4, ~7 h)
+# smoke recipe (~1.6-1.9 h: 150+300 micros = 112 effective steps)
 cargo run --release -- --cpu --train-enricher --model-dir models/gemma-3-270m-it \
     --train-steps-warmup 150 --train-steps-st 300 \
     --train-out enricher_v2.safetensors
 
-# explicit full form
+# full-night form (the Claim-R overnight recipe: 600+1800 micros ~ 8 h);
+# lambda 1.0 applies to factored variants at d >= 64 (see the calibration
+# verdict); d=32 / V0 uses the 0.1 default
 cargo run --release -- --cpu --train-enricher --model-dir models/gemma-3-270m-it \
-    --train-steps-warmup 150 --train-steps-st 300 \
+    --train-steps-warmup 600 --train-steps-st 1800 \
     --train-tau 6 --train-kv-grad --train-batch 4 --train-accum 4 \
     --train-gate-bias 2.0 --train-lr-warmup 50 --train-gate-floor 0.5 \
-    --train-inj-l2 0.1 --train-out enricher_v2.safetensors
+    --train-inj-l2 1.0 \
+    --train-enrich-rank 64 --train-enrich-act gelu --train-enrich-residual pick \
+    --train-out enricher_r_d64_pick.safetensors
 
 # tau-sweep diagnostic in isolation (per-process peak RSS is the honest
 # number; in-process sweeps ratchet the allocator high-water mark)

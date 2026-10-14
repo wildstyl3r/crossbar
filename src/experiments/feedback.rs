@@ -42,10 +42,10 @@ pub struct FeedbackConfig {
     /// Weight of the per-position expected embedding in the prefill input;
     /// 0 disables prefill feedback.
     pub prefill_blend: f64,
-    /// Number of prefill-feedback refinement iterations (Schedule B
-    /// cascade): iteration 0 observes the raw prompt, iteration k re-forwards
-    /// `(1 - a_p) * E + a_p * expected(logits_{k-1})`; 1 is the single
-    /// refinement pass, >= 2 the iterated cascade.
+    /// Number of prefill-feedback refinement iterations (the iterated
+    /// prefill cascade): iteration 0 observes the raw prompt, iteration k
+    /// re-forwards `(1 - a_p) * E + a_p * expected(logits_{k-1})`; 1 is the
+    /// single refinement pass, >= 2 the iterated cascade.
     pub prefill_iters: usize,
 }
 

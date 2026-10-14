@@ -851,15 +851,15 @@ impl SchemaMasker {
             }
             pairs.push((id as u32, text));
         }
-        Ok(Self::from_parts(schema, eos_tokens, pairs))
+        Self::from_parts(schema, eos_tokens, pairs)
     }
 
     pub fn from_parts(
         schema: &Value,
         eos_tokens: Vec<u32>,
         pairs: impl IntoIterator<Item = (u32, String)>,
-    ) -> Self {
-        let top = compile_schema(schema).expect("schema must compile");
+    ) -> Result<Self> {
+        let top = compile_schema(schema)?;
         let mut trie = TokenTrie::new();
         let vocab = pairs
             .into_iter()
@@ -884,13 +884,13 @@ impl SchemaMasker {
             }
         }
         let machine = Machine::new(top);
-        Self {
+        Ok(Self {
             trie,
             initial: machine.clone(),
             machine,
             eos: eos_tokens,
             token_bytes,
-        }
+        })
     }
 
     /// All vocab ids whose next token keeps the output schema-valid
@@ -955,7 +955,6 @@ impl SchemaMasker {
 impl LogitsFilter for SchemaMasker {
     fn mask(&mut self, logits: &mut [f32]) {
         let Some(allowed) = self.allowed() else {
-            eprintln!("[grammar] no allowed set; not masking");
             return;
         };
         let mut keep = vec![false; logits.len()];
@@ -978,7 +977,8 @@ impl LogitsFilter for SchemaMasker {
         };
         for &b in bytes.iter() {
             if !self.machine.feed(b) {
-                eprintln!("[grammar] constraint desync at token {token}; resetting");
+                // Desync (a token that cannot occur under the schema still
+                // arrived): reset to the initial state and keep masking.
                 self.machine = self.initial.clone();
                 return;
             }
@@ -1203,7 +1203,7 @@ mod tests {
         ];
         let texts = ["{", "\"", "name", ":", "x\"", "\"}", " ", ",", "}"];
         let expected = r#"{"name": "x"}"#;
-        let mut m = SchemaMasker::from_parts(&schema, vec![0], pairs);
+        let mut m = SchemaMasker::from_parts(&schema, vec![0], pairs).unwrap();
         let mut text = String::new();
         for _ in 0..20 {
             let allowed = m.allowed().expect("some token must be allowed");
@@ -1238,7 +1238,7 @@ mod tests {
             (7, "}".to_string()),
             (8, "x".to_string()),
         ];
-        let mut m = SchemaMasker::from_parts(&schema, vec![0], pairs);
+        let mut m = SchemaMasker::from_parts(&schema, vec![0], pairs).unwrap();
         let allowed = m.allowed().unwrap();
         assert!(allowed.contains(&1));
         assert!(

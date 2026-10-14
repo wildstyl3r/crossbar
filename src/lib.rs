@@ -1,6 +1,7 @@
-//! crossbar: Gemma-3 inference on candle, with the experimental softmax
-//! -feedback decoding and gated state-readout enricher work isolated in
-//! the `experiments` submodule.
+//! crossbar: Gemma-3 inference on candle. The experimental softmax-feedback
+//! decoding and gated state-readout enricher work (specs, CLI groups,
+//! training, bench) lives in the `experiments` submodule; the decode-time
+//! hooks it plugs into are part of the core backends.
 
 pub mod assets;
 pub mod chat;

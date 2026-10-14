@@ -92,7 +92,7 @@ impl DecoderLayer {
             .transpose(1, 2)?;
         let q = attn.q_norm.forward(&q)?;
         let k = attn.k_norm.forward(&k)?;
-        let (q, k) = attn.rotary_emb.apply_rotary_emb_qkv(&q, &k, pos)?;
+        let (q, k) = attn.rotary_emb.apply_rotary_emb_qk(&q, &k, pos)?;
         let (k, v) = if kv_grad {
             (k, v)
         } else {

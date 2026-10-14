@@ -159,8 +159,8 @@ ten things to pack for a camping trip":
   blur above the model's own distribution costs quality in confident regimes.
 - Possible follow-ups: truncate/renormalize the feedback distribution
   (top-k/top-p mass) to kill tail blur at T = 1; per-layer or per-position
-  temperatures; blending the fed-back input with the sampled token's
-  embedding.
+  temperatures. (The third follow-up — blending the fed-back input with the
+  sampled token's embedding — was implemented and measured: Finding 7.)
 
 ## Finding 6: capability impact measured with `--bench`
 
@@ -221,88 +221,24 @@ Interpretation:
 Reproduce: `cargo run --release -- --cpu --bench --bench-n 100` (per-example
 rows land in `bench_results.csv`; calibration used `--bench-n 25`).
 
-## Design notes: blending with the sampled token, and prefill feedback
+## Finding 7: blending rescues most of the induction damage; parallel prefill feedback is destructive
 
-This section records the rationale and plan for the blend / prefill-feedback
-extension (implemented in the same session as Finding 7 below).
-
-### Motivation
-
-The intuition behind the whole feedback approach: during a single token
-processing step many different "memories" (associations) are activated and
-interact to form the output vector, but that rich mixture is thrown away at
-the sampling step — only a single discrete token id survives, and the next
-step's early layers have to (almost) start from scratch. The later layers do
-retain access to the emergent mixture via the KV cache / attention, but the
-first layers see only one token embedding. Feeding the expected embedding
-softens this loss; the looped/universal-transformer line of work (applying
-the same weights repeatedly over the same tokens) suggests that spending
-more compute on already-picked concepts should help emerging ideas persist.
-
-Finding 6 localized the cost of the pure expected embedding: the induction
-head needs the exact previous-token identity as its attention key, and the
-expected embedding smears that key over the token's neighborhood (recall
-survives, precision dies: "68" → "6"). Blending the expected embedding with
-the sampled token's embedding re-anchors that key while keeping the
-neighborhood mass:
+Two extensions of the feedback path were bench-tested (both are CLI knobs of
+the same mechanism): **decode blending** mixes the expected embedding with
+the sampled token's embedding — re-anchoring the exact attention key the
+induction head needs while keeping the neighborhood mass:
 
 ```
 input_t = (1 - a) * E[a_t] * sqrt(h)  +  a * (softmax(logits_{t-1} / T) @ E) * sqrt(h)
 ```
 
-This is also naturally self-attenuating: when the model is confident
-(H_fb → 0) the expected embedding converges to E[a_t] and the blend becomes
-the normal input for any a — the mechanism fades out exactly where it is
-least needed, consistent with the robustness of digits/trivia in Finding 6.
-
-### Prefill feedback
-
-Treating prefill as zero-context decoding with forced results: run an
-observation pass over the prompt (full-position logits), build per-position
-expected embeddings, blend them with the prompt token embeddings, and run
-the injection pass that builds the KV cache the decode loop continues from.
-This applies the strategy to prompt processing itself — the "thinking" that
-shaped the prompt's representations is not lost between the raw pass and
-the generating pass.
-
-- Two-pass, chunked (64 positions/chunk): per chunk compute logits for all
-  chunk positions → expected embeddings (kept, small) → logits discarded;
-  layer KV caches reset between passes so the injection pass builds a clean
-  cache. Cost ≈ 2x prefill (negligible at these prompt lengths).
-- `a_p = 0` (default) keeps prefill exactly as before; decode blend and
-  prefill blend are independent knobs (prefill-only is a valid experiment).
-- Servo on prefill: one T solved per chunk with target scaled by chunk
-  length (mean per-position entropy match); per-position solving deferred.
-- Diagnostics: one summary line (T, mean per-position H) with
-  `--softmax-feedback-diagnostics`.
-
-### Parallel vs cascading (scope note)
-
-The implemented prefill feedback is **parallel**: all blends are derived
-from one round of raw-context processing. The initial idea was the
-**cascading** variant — position n+1 processed with the enriched position n
-already in its context, so each position's emergent distribution reflects
-already-enriched thinking. That is precisely the decode feedback loop run
-over the prompt with forced tokens (sequential, one position per forward).
-It is mechanically close to free to add later (reuse the decode-feedback
-machinery with teacher-forced tokens) and is the natural generalization —
-the looped/universal-transformer K-iteration scheme. Deferred as future
-work; the parallel variant measures how much one extra observation pass
-alone buys.
-
-### What to measure (Finding 7 hypotheses)
-
-Bench round 2 adds blend modes to the round-1 matrix:
-
-- `blend-d0.5`: decode blend a=0.5, T=1 — does re-anchoring rescue
-  induction (Finding 6 damage) while keeping feedback benefits?
-- `prefill-p0.5`: prefill blend a_p=0.5, normal decode — does enriched
-  prompt processing alone improve induction?
-- `both-0.5`: both blends — combined effect.
-
-## Finding 7: blending rescues most of the induction damage; parallel prefill feedback is destructive
-
-Bench round 2 (same protocol as Finding 6, greedy, paired, N=100/40):
+and **prefill feedback** applies the same idea to prompt processing: an
+observation pass over the prompt builds per-position expected embeddings,
+blended into the injection pass that builds the KV cache the decode loop
+continues from (`a_p`, two-pass, chunked; `a_p = 0` default keeps prefill
+untouched). Bench round 2 modes: `blend-d0.5` (decode blend a=0.5, T=1),
+`prefill-p0.5` (prefill blend a_p=0.5, normal decode), `both-0.5` (both).
+Same protocol as Finding 6, greedy, paired, N=100/40:
 
 | task      | baseline | blend-d0.5 | prefill-p0.5 | both-0.5 |
 |-----------|----------|------------|--------------|----------|
@@ -334,8 +270,8 @@ Bench round 2 (same protocol as Finding 6, greedy, paired, N=100/40):
 
 ## Finding 8: iterated prefill cascade at gentle strength improves induction (+18, p=0.006) without collateral damage
 
-Implementation: `--prefill-feedback-iters K` (Schedule B from ENRICHER.md).
-Iteration 0 is the existing observation pass; iterations k = 1..K re-forward
+Implementation: `--prefill-feedback-iters K`. Iteration 0 is the existing
+observation pass; iterations k = 1..K re-forward
 `(1 - a_p) * E_prompt + a_p * expected(logits_{k-1})` over all positions
 with fresh caches; decode continues from iteration K's cache. Cost:
 (K+1) full prefills. K=1 reproduces the old `prefill-p0.5` bit-exactly
@@ -388,12 +324,12 @@ Reproduce:
 ```sh
 # dynamics probe (per-step CSV on stderr)
 cargo run --release -- --cpu -p "<long France paragraph>" -n 40 --seed 7 \
-    --temperature 0 --debug-logits --softmax-feedback-diagnostics \
+    --temperature 0 --softmax-feedback-diagnostics \
     --prefill-feedback-blend 0.25 --prefill-feedback-iters 2
 
 # bench (cascade modes; filters select the subset)
 cargo run --release -- --cpu --bench --bench-n 100 --bench-tasks induce,trivia \
-    --bench-modes baseline,cascade-k2-a25 --bench-out logs/cascade_confirm_induce.csv
+    --bench-modes baseline,cascade-k2-a25
 ```
 
 ## Bench validity note (2026-10-08): `induce` queries are always the last-stated pair

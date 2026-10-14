@@ -1,7 +1,7 @@
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use candle::quantized::{QMatMul as InnerQMatMul, QTensor, gguf_file};
+use candle::quantized::{QMatMul, QTensor, gguf_file};
 use candle::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Embedding, kv_cache::KvCache, kv_cache::RotatingKvCache};
 
@@ -13,25 +13,6 @@ use crate::experiments::feedback::{
 use crate::model::layers::{
     KvCacheKind, RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask, repeat_kv,
 };
-use crate::model::ProbeOut;
-
-struct QMatMul {
-    inner: InnerQMatMul,
-}
-
-impl QMatMul {
-    fn from_qtensor(qt: QTensor) -> Result<Self> {
-        Ok(Self {
-            inner: InnerQMatMul::from_qtensor(qt)?,
-        })
-    }
-}
-
-impl Module for QMatMul {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.inner.forward(xs)
-    }
-}
 
 fn md_u32(ct: &gguf_file::Content, key: &str) -> Option<u32> {
     ct.metadata
@@ -50,6 +31,8 @@ fn req_u32(ct: &gguf_file::Content, key: &str) -> Result<u32> {
         .ok_or_else(|| candle::Error::Msg(format!("missing gemma3.{key} in GGUF metadata")))
 }
 
+/// GGUF stores RmsNorm weights as `weight - 1` (the +1 is implicit in the
+/// RMS formula); subtract it back out so `RmsNorm` can re-add it.
 fn norm_from_gguf(t: QTensor, eps: f64, device: &Device) -> Result<RmsNorm> {
     let weight = (t.dequantize(device)?.to_dtype(DType::F32)? - 1.0f64)?;
     Ok(RmsNorm::from_weight(weight, eps))
@@ -128,7 +111,7 @@ impl QuantizedAttention {
 
         let (query_states, key_states) =
             self.rotary_emb
-                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+                .apply_rotary_emb_qk(&query_states, &key_states, seqlen_offset)?;
 
         let (key_states, value_states) = match &mut self.kv_cache {
             KvCacheKind::Normal(cache) => cache.append(&key_states, &value_states)?,
@@ -465,17 +448,15 @@ impl QuantizedModel {
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
         let last = xs.narrow(1, seq_len - 1, 1)?;
         let out = self.finish(last.clone())?;
-        if self.enricher.is_some() {
+        if let Some(enr) = &mut self.enricher {
             let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
-            if let Some(enr) = &mut self.enricher {
-                enr.push_state(state);
-            }
+            enr.push_state(state);
         }
         Ok(out)
     }
 
-    /// Feed the previous step's blended input (expected token embedding +
-    /// sampled token embedding) back into the first block, skipping the pure
+    /// Feed the previous step's blended input ((1 - a) sampled-token +
+    /// a expected embedding) back into the first block, skipping the pure
     /// embedding lookup of the sampled token. Also resolves the feedback
     /// temperature for the configured mode and returns the per-step
     /// feedback statistics.
@@ -689,11 +670,9 @@ impl QuantizedModel {
         };
         let last = xs.narrow(1, seq_len - 1, 1)?;
         let logits = self.finish(last.clone())?;
-        if self.enricher.is_some() {
+        if let Some(enr) = &mut self.enricher {
             let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
-            if let Some(enr) = &mut self.enricher {
-                enr.push_state(state);
-            }
+            enr.push_state(state);
         }
         Ok((logits, stats))
     }
@@ -771,46 +750,4 @@ impl QuantizedModel {
             enr.clear_state();
         }
     }
-
-    pub fn probe(&mut self, token: u32) -> Result<ProbeOut> {
-        let row = self
-            .embed_tokens
-            .embeddings()
-            .narrow(0, token as usize, 1)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?;
-        let row_v = row.to_vec1::<f32>()?;
-        let norm = (row_v.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
-        let input = Tensor::new(&[token], &self.device)?.unsqueeze(0)?;
-        let logits = self.forward(&input, 0)?;
-        let logits = logits.squeeze(0)?.squeeze(0)?.to_vec1::<f32>()?;
-        let mut order: Vec<usize> = (0..logits.len()).collect();
-        order.sort_by(|&i, &j| logits[j].total_cmp(&logits[i]));
-        let top5 = order
-            .iter()
-            .take(5)
-            .map(|&i| (i as u32, logits[i]))
-            .collect();
-        Ok(((row_v[..5].to_vec(), norm), top5))
-    }
-}
-
-pub fn probe_weights(path: &str, device: &Device) -> Result<()> {
-    let mut reader = std::fs::File::open(path)?;
-    let ct = gguf_file::Content::read(&mut reader)?;
-    for name in [
-        "output_norm.weight",
-        "blk.0.attn_norm.weight",
-        "blk.0.attn_q_norm.weight",
-        "blk.0.attn_q.weight",
-        "blk.0.ffn_gate.weight",
-        "token_embd.weight",
-    ] {
-        let t = ct.tensor(&mut reader, name, device)?;
-        let flat = t.dequantize(device)?.to_dtype(DType::F32)?.flatten_all()?;
-        let n = flat.elem_count().min(8);
-        let vals = flat.narrow(0, 0, n)?.to_vec1::<f32>()?;
-        println!("gguf {name}[:{n}] = {vals:?}");
-    }
-    Ok(())
 }

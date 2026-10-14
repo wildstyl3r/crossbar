@@ -247,7 +247,6 @@ pub struct TextGeneration {
     device: Device,
     tokenizer: TokenOutputStream,
     eos_tokens: Vec<u32>,
-    debug_logits: bool,
     softmax_feedback: bool,
     prefill_feedback: bool,
     diagnostics: bool,
@@ -255,13 +254,11 @@ pub struct TextGeneration {
 }
 
 impl TextGeneration {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: Engine,
         tokenizer: Tokenizer,
         eos_tokens: Vec<u32>,
         device: &Device,
-        debug_logits: bool,
         softmax_feedback: bool,
         prefill_feedback: bool,
         diagnostics: bool,
@@ -271,7 +268,6 @@ impl TextGeneration {
             tokenizer: TokenOutputStream::new(tokenizer),
             eos_tokens,
             device: device.clone(),
-            debug_logits,
             softmax_feedback,
             prefill_feedback,
             diagnostics,
@@ -456,19 +452,6 @@ impl TextGeneration {
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let mut logits = logits.to_vec1::<f32>()?;
 
-            if self.debug_logits && index == 0 {
-                let mut order: Vec<usize> = (0..logits.len()).collect();
-                order.sort_by(|&i, &j| logits[j].total_cmp(&logits[i]));
-                for &i in order.iter().take(5) {
-                    let text = self
-                        .tokenizer
-                        .tokenizer()
-                        .decode(&[i as u32], true)
-                        .unwrap_or_default();
-                    println!("  logit[{i}] = {:.4} {:?}", logits[i], text);
-                }
-            }
-
             let want_stats = self.diagnostics || self.collect_stats;
             let diag_raw = if want_stats {
                 let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -505,7 +488,9 @@ impl TextGeneration {
             prev_fb = fb_logits.take().map(|l| (l, next_token));
             let sampling = t.elapsed();
             if index == 0 {
-                prefill_total = step_start.elapsed();
+                // += : in the non-chunked KV-reuse path the warm-up loop
+                // already accumulated the suffix prefill time.
+                prefill_total += step_start.elapsed();
             } else {
                 decode_tokens += 1;
                 decode_forward += forward;
@@ -641,13 +626,14 @@ impl TextGeneration {
             outcome.tokens as f64 / timing.total.as_secs_f64(),
             outcome.reason,
         );
+        // Positions actually forwarded (the cached prefix is not re-prefilled).
+        let prefilled = timing.prompt_len.saturating_sub(timing.reused_prefix);
         println!(
             "prefill: {} tokens in {:.1} ms ({:.2} ms/token)",
-            timing.prompt_len,
+            prefilled,
             timing.prefill.as_secs_f64() * 1000.0,
-            timing.prefill.as_secs_f64() * 1000.0 / timing.prompt_len.max(1) as f64,
+            timing.prefill.as_secs_f64() * 1000.0 / prefilled.max(1) as f64,
         );
-        let prefilled = timing.prompt_len.saturating_sub(timing.reused_prefix);
         if timing.reused_prefix > 0 {
             println!(
                 "kv reuse: {} tokens served from the cache, {} re-prefilled",

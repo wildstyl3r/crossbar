@@ -519,7 +519,6 @@ pub fn run_bench(
             tokenizer.clone(),
             eos_tokens.clone(),
             device,
-            false,
             mode.decode,
             mode.prefill,
             false,

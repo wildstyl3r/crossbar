@@ -5,6 +5,7 @@
 use crate::cli::Args;
 use crate::experiments::enrich;
 use crate::experiments::feedback::{FeedbackConfig, FeedbackTempMode};
+use crate::experiments::train;
 
 #[derive(clap::Args, Debug)]
 pub struct BenchArgs {
@@ -59,11 +60,11 @@ pub struct FeedbackArgs {
     #[arg(long, default_value_t = 0.0)]
     pub prefill_feedback_blend: f64,
 
-    /// Number of prefill-feedback refinement iterations (Schedule B
-    /// cascade): iteration 0 observes the raw prompt, iteration k re-forwards
-    /// (1 - a_p) * E + a_p * expected(logits_{k-1}) over all positions; 1 is
-    /// the single refinement pass (the original prefill feedback), >= 2 the
-    /// iterated cascade.
+    /// Number of prefill-feedback refinement iterations (the iterated
+    /// prefill cascade): iteration 0 observes the raw prompt, iteration k
+    /// re-forwards (1 - a_p) * E + a_p * expected(logits_{k-1}) over all
+    /// positions; 1 is the single refinement pass (the original prefill
+    /// feedback), >= 2 the iterated cascade.
     #[arg(long, default_value_t = 1)]
     pub prefill_feedback_iters: usize,
 
@@ -166,9 +167,9 @@ pub struct TrainArgs {
 
     /// Micro-steps accumulated per optimizer step: effective batch =
     /// batch x accum. batch 4 x accum 4 (effective 16) is the default
-    /// overnight recipe: ~3.5-4 GB peak, ~50-55 s/step, warmup 150 + ST 300
-    /// ~ 7 h. accum 8 halves the step count budget; accum 16 only if noise
-    /// demonstrably dominates.
+    /// recipe: ~3.5-4 GB peak, ~50 s/step; warmup 150 + ST 300 micros
+    /// ~ 1.6-1.9 h, and a full night is ~3k micros ~ 7-10 h. accum 8 halves
+    /// the step count budget; accum 16 only if noise demonstrably dominates.
     #[arg(long, default_value_t = 4)]
     pub train_accum: usize,
 
@@ -227,6 +228,51 @@ pub struct TrainArgs {
     pub train_enrich_residual: EnrichResidual,
 }
 
+impl TrainArgs {
+    fn enrich_residual(&self) -> enrich::ResidualMode {
+        match self.train_enrich_residual {
+            EnrichResidual::None => enrich::ResidualMode::None,
+            EnrichResidual::Pick => enrich::ResidualMode::Pick,
+        }
+    }
+
+    fn enricher_spec(&self) -> enrich::EnricherSpec {
+        enrich::EnricherSpec {
+            rank: self.train_enrich_rank,
+            gelu: matches!(self.train_enrich_act, EnrichAct::Gelu),
+            content_gate: self.train_enrich_content_gate,
+            a_mode: match self.train_enrich_a {
+                EnrichAMode::Trainable => enrich::AMode::Trainable,
+                EnrichAMode::Fixed => enrich::AMode::FixedRandom,
+                EnrichAMode::Pca => enrich::AMode::Pca,
+            },
+            residual: self.enrich_residual(),
+        }
+    }
+}
+
+impl From<&TrainArgs> for train::TrainConfig {
+    fn from(t: &TrainArgs) -> Self {
+        Self {
+            gate_bias: t.train_gate_bias,
+            lr_warmup: t.train_lr_warmup,
+            gate_floor: t.train_gate_floor,
+            gt_start: t.train_gt_start,
+            gt_end: t.train_gt_end,
+            inj_l2: t.train_inj_l2,
+            tau: t.train_tau,
+            kv_grad: t.train_kv_grad,
+            batch: t.train_batch,
+            accum: t.train_accum,
+            sweep: t.train_sweep.clone(),
+            grad_clip: t.train_grad_clip,
+            seed: t.train_seed,
+            skip_eval: t.train_skip_eval,
+            spec: t.enricher_spec(),
+        }
+    }
+}
+
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum EnrichAct {
     None,
@@ -263,24 +309,10 @@ impl Args {
     }
 
     pub fn enrich_residual(&self) -> enrich::ResidualMode {
-        match self.train_args.train_enrich_residual {
-            EnrichResidual::None => enrich::ResidualMode::None,
-            EnrichResidual::Pick => enrich::ResidualMode::Pick,
-        }
+        self.train_args.enrich_residual()
     }
 
     pub fn enricher_spec(&self) -> enrich::EnricherSpec {
-        let t = &self.train_args;
-        enrich::EnricherSpec {
-            rank: t.train_enrich_rank,
-            gelu: matches!(t.train_enrich_act, EnrichAct::Gelu),
-            content_gate: t.train_enrich_content_gate,
-            a_mode: match t.train_enrich_a {
-                EnrichAMode::Trainable => enrich::AMode::Trainable,
-                EnrichAMode::Fixed => enrich::AMode::FixedRandom,
-                EnrichAMode::Pca => enrich::AMode::Pca,
-            },
-            residual: self.enrich_residual(),
-        }
+        self.train_args.enricher_spec()
     }
 }

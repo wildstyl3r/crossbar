@@ -1,12 +1,12 @@
 //! Experimental mechanisms layered on top of the plain Gemma-3 engine.
 //!
-//! Nothing in this module is required to run the base model: the core
-//! (`model`, `quantized_model`, `engine`, `generation`, ...) only imports
-//! types from here and exposes the decode-time hooks these experiments plug
-//! into (the softmax-feedback / prefill-cascade / enricher-cascade paths
-//! inside the backends). Design notes and experiment logs live alongside
-//! the code they describe: `FEEDBACK.md` (softmax-feedback decoding) and
-//! `ENRICHER.md` (the gated state-readout enricher and its training).
+//! Nothing here is required for plain generation: the specs, CLI groups,
+//! training and bench tooling live in this module, and the core backends
+//! expose the decode-time hooks these mechanisms plug into (the
+//! softmax-feedback / prefill-cascade / enricher-cascade paths). Design
+//! notes and experiment logs live alongside the code they describe:
+//! `FEEDBACK.md` (softmax-feedback decoding) and `ENRICHER.md` (the gated
+//! state-readout enricher and its training).
 //!
 //! | Module | Responsibility |
 //! |---|---|

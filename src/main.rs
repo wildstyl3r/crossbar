@@ -19,15 +19,7 @@ use crossbar::experiments::train;
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    println!(
-        "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        candle::utils::with_avx(),
-        candle::utils::with_neon(),
-        candle::utils::with_simd128(),
-        candle::utils::with_f16c()
-    );
 
-    let start = std::time::Instant::now();
     let model_dir = std::path::Path::new(&args.model_dir);
     let fallback_dir = std::path::Path::new(&args.fallback_dir);
     let generation_config: GenerationConfig = match std::fs::File::open(resolve_file(
@@ -41,7 +33,6 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(resolve_file(model_dir, fallback_dir, "tokenizer.json")?)
         .map_err(E::msg)?;
     let gguf_file = find_gguf_file(model_dir);
-    println!("retrieved the files in {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
     let device = if args.cpu {
@@ -74,7 +65,7 @@ fn main() -> Result<()> {
             };
             let weight_files = crossbar::assets::find_weight_files(model_dir)?;
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
-            Ok(Engine::F32(model::Model::new(&config, vb, feedback)?))
+            Ok(Engine::Safetensors(model::Model::new(&config, vb, feedback)?))
         }
     };
     let feedback = args.feedback_config();
@@ -106,47 +97,16 @@ fn main() -> Result<()> {
             )?;
             return Ok(());
         }
-        let t = &args.train_args;
         train::run(
             &mut engine,
             &tokenizer,
             &chat_template,
             &device,
-            t.train_steps_warmup,
-            t.train_steps_st,
-            &t.train_out,
-            train::TrainConfig {
-                gate_bias: t.train_gate_bias,
-                lr_warmup: t.train_lr_warmup,
-                gate_floor: t.train_gate_floor,
-                gt_start: t.train_gt_start,
-                gt_end: t.train_gt_end,
-                inj_l2: t.train_inj_l2,
-                tau: t.train_tau,
-                kv_grad: t.train_kv_grad,
-                batch: t.train_batch,
-                accum: t.train_accum,
-                sweep: t.train_sweep.clone(),
-                grad_clip: t.train_grad_clip,
-                seed: t.train_seed,
-                skip_eval: t.train_skip_eval,
-                spec,
-            },
+            args.train_args.train_steps_warmup,
+            args.train_args.train_steps_st,
+            &args.train_args.train_out,
+            train::TrainConfig::from(&args.train_args),
         )?;
-        return Ok(());
-    }
-
-    if args.probe {
-        let token = tokenizer.token_to_id("Paris").context("no Paris token")?;
-        let (row, top5) = engine.probe(token)?;
-        println!("probe token {token}: row[:5]={row:?}");
-        println!("probe token {token}: row norm={:.4}", row.1);
-        for (i, l) in top5 {
-            println!("  logit[{i}] = {l:.4}");
-        }
-        if let Some(gguf_path) = &gguf_file {
-            quantized_model::probe_weights(&gguf_path.to_string_lossy(), &device)?;
-        }
         return Ok(());
     }
 
@@ -204,7 +164,6 @@ fn main() -> Result<()> {
             tokenizer,
             eos_tokens.clone(),
             &device,
-            args.debug_logits,
             fb.softmax_feedback,
             fb.prefill_feedback_blend > 0.0,
             fb.softmax_feedback_diagnostics,
@@ -223,7 +182,7 @@ fn main() -> Result<()> {
     let prompt = args
         .prompt
         .as_deref()
-        .context("--prompt is required unless --probe, --bench or --repl is set")?;
+        .context("--prompt is required unless --bench, --train-enricher or --repl is set")?;
     let prompt = chat::render(&chat_template, args.system.as_deref(), prompt)?;
 
     println!(
@@ -269,7 +228,6 @@ fn main() -> Result<()> {
         tokenizer,
         eos_tokens,
         &device,
-        args.debug_logits,
         fb.softmax_feedback,
         fb.prefill_feedback_blend > 0.0,
         fb.softmax_feedback_diagnostics,

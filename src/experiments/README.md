@@ -3,12 +3,8 @@
 Experimental mechanisms layered on top of the plain Gemma-3 engine:
 softmax-feedback decoding, a trained gated state-readout enricher, the
 enricher's TBPTT training, and a synthetic-task feedback-impact benchmark
-suite.
-
-Nothing here is required to run the base model: the core (`model`,
-`quantized_model`, `engine`, `generation`, ...) only imports types from
-`experiments` and exposes the decode-time hooks these experiments plug
-into. See the repository README for the core architecture.
+suite. See the repository README for the core architecture and the
+decode-time hooks these mechanisms plug into.
 
 ## Module map
 
@@ -21,7 +17,7 @@ into. See the repository README for the core architecture.
 | `tasks.rs` | synthetic task generators (state-track, induce-d) + exact-match scoring, shared by trainer and bench |
 | `bench.rs` | feedback-impact benchmark suite: tasks, modes, McNemar stats, CSV output |
 | `args.rs` | clap argument groups (`FeedbackArgs`, `TrainArgs`, `BenchArgs`) + CLI-to-domain converters (`feedback_config`, `enricher_spec`) |
-| `ENRICHER.md` | enricher design, BPTT analysis, plan |
+| `ENRICHER.md` | enricher design, BPTT analysis, results |
 | `FEEDBACK.md` | softmax-feedback experiments and findings |
 
 ## Flows

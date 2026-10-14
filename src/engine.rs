@@ -1,4 +1,5 @@
-//! Backend dispatch: safetensors (F32) vs GGUF (quantized) model engines.
+//! Backend dispatch: the safetensors model (F32 on CPU, BF16 on CUDA) vs
+//! the GGUF (quantized) model.
 
 use anyhow::Result;
 
@@ -9,7 +10,7 @@ use crate::model;
 use crate::quantized_model;
 
 pub enum Engine {
-    F32(model::Model),
+    Safetensors(model::Model),
     Quantized(quantized_model::QuantizedModel),
 }
 
@@ -20,7 +21,7 @@ impl Engine {
         pos: usize,
     ) -> candle::Result<candle::Tensor> {
         match self {
-            Self::F32(m) => m.forward(input_ids, pos),
+            Self::Safetensors(m) => m.forward(input_ids, pos),
             Self::Quantized(m) => m.forward(input_ids, pos),
         }
     }
@@ -32,7 +33,7 @@ impl Engine {
         pos: usize,
     ) -> candle::Result<(candle::Tensor, FeedbackStats)> {
         match self {
-            Self::F32(m) => m.forward_feedback(logits, sampled_token, pos),
+            Self::Safetensors(m) => m.forward_feedback(logits, sampled_token, pos),
             Self::Quantized(m) => m.forward_feedback(logits, sampled_token, pos),
         }
     }
@@ -42,29 +43,22 @@ impl Engine {
         input_ids: &candle::Tensor,
     ) -> candle::Result<(candle::Tensor, PrefillStats)> {
         match self {
-            Self::F32(m) => m.forward_prompt_blend(input_ids),
+            Self::Safetensors(m) => m.forward_prompt_blend(input_ids),
             Self::Quantized(m) => m.forward_prompt_blend(input_ids),
         }
     }
 
     pub fn clear_kv_cache(&mut self) {
         match self {
-            Self::F32(m) => m.clear_kv_cache(),
+            Self::Safetensors(m) => m.clear_kv_cache(),
             Self::Quantized(m) => m.clear_kv_cache(),
-        }
-    }
-
-    pub fn probe(&mut self, token: u32) -> candle::Result<model::ProbeOut> {
-        match self {
-            Self::F32(m) => m.probe(token),
-            Self::Quantized(m) => m.probe(token),
         }
     }
 
     pub fn set_enricher(&mut self, path: &str) -> Result<()> {
         let enr = enrich::Enricher::load(path)?;
         match self {
-            Self::F32(m) => m.set_enricher(enr),
+            Self::Safetensors(m) => m.set_enricher(enr),
             Self::Quantized(m) => m.set_enricher(enr),
         }
         Ok(())
@@ -72,7 +66,7 @@ impl Engine {
 
     pub fn has_enricher(&self) -> bool {
         match self {
-            Self::F32(m) => m.has_enricher(),
+            Self::Safetensors(m) => m.has_enricher(),
             Self::Quantized(m) => m.has_enricher(),
         }
     }
@@ -82,12 +76,12 @@ impl Engine {
     /// decode step while the enricher is attached.
     pub fn cascade_step(&mut self, token: u32, pos: usize) -> candle::Result<candle::Tensor> {
         match self {
-            Self::F32(m) => m.cascade_step(token, pos),
+            Self::Safetensors(m) => m.cascade_step(token, pos),
             Self::Quantized(m) => m.cascade_step(token, pos),
         }
     }
 
-    /// Sequential cascade training forward (TBPTT); F32 backend only.
+    /// Sequential cascade training forward (TBPTT); safetensors backend only.
     #[allow(clippy::too_many_arguments)]
     pub fn cascade_train_forward(
         &self,
@@ -102,7 +96,7 @@ impl Engine {
         rng: &mut rand::rngs::StdRng,
     ) -> Result<CascadeTrainOut> {
         match self {
-            Self::F32(m) => Ok(m.cascade_train_forward(
+            Self::Safetensors(m) => Ok(m.cascade_train_forward(
                 enr,
                 input_ids,
                 targets,
@@ -119,7 +113,7 @@ impl Engine {
 
     pub fn hidden(&self) -> usize {
         match self {
-            Self::F32(m) => m.hidden_size(),
+            Self::Safetensors(m) => m.hidden_size(),
             Self::Quantized(m) => m.hidden_size(),
         }
     }
@@ -127,7 +121,7 @@ impl Engine {
     /// Maximum context window (positions) the backend supports.
     pub fn max_positions(&self) -> usize {
         match self {
-            Self::F32(m) => m.max_positions(),
+            Self::Safetensors(m) => m.max_positions(),
             Self::Quantized(m) => m.max_positions(),
         }
     }
@@ -135,14 +129,14 @@ impl Engine {
     /// Attention sliding window (0 when every layer is full attention).
     pub fn sliding_window(&self) -> usize {
         match self {
-            Self::F32(m) => m.sliding_window(),
+            Self::Safetensors(m) => m.sliding_window(),
             Self::Quantized(m) => m.sliding_window(),
         }
     }
 
     pub fn attach_enricher(&mut self, enr: enrich::Enricher) -> Result<()> {
         match self {
-            Self::F32(m) => m.set_enricher(enr),
+            Self::Safetensors(m) => m.set_enricher(enr),
             Self::Quantized(_) => anyhow::bail!("training requires the safetensors backend"),
         }
         Ok(())

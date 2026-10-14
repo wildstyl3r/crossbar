@@ -24,7 +24,7 @@ pub struct Args {
     pub cpu: bool,
 
     /// The prompt to run the generator with (required unless --bench,
-    /// --probe or --repl is set).
+    /// --train-enricher or --repl is set).
     #[arg(long, short = 'p')]
     pub prompt: Option<String>,
 
@@ -68,14 +68,6 @@ pub struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     pub repeat_last_n: usize,
-
-    /// Print the top-5 logits of the first generated token (debug).
-    #[arg(long)]
-    pub debug_logits: bool,
-
-    /// Dump embedding row and single-token logits for a token (debug).
-    #[arg(long)]
-    pub probe: bool,
 
     /// Load a trained gated state-readout enricher checkpoint; prefill
     /// becomes the sequential forced-token cascade and every decode step is

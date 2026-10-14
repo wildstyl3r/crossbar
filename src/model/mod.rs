@@ -1,14 +1,15 @@
-//! Gemma-3 F32 (safetensors) model: architecture wiring and inference paths
-//! (plain forward, softmax feedback, prefill cascade, enricher cascade).
+//! Gemma-3 safetensors model (F32 on CPU, BF16 on CUDA): architecture
+//! wiring and inference paths (plain forward, softmax feedback, prefill
+//! cascade, enricher cascade).
 
 pub(crate) mod layers;
 
 use crate::config::Config;
-pub(crate) use crate::experiments::feedback::solve_entropy_temperature;
+use crate::experiments::feedback::solve_entropy_temperature;
 use crate::experiments::feedback::{
     FeedbackConfig, FeedbackStats, FeedbackTempMode, PrefillStats,
 };
-pub(crate) use layers::{RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask};
+use layers::{RmsNorm, RotaryEmbedding, prepare_decoder_attention_mask};
 
 use std::sync::Arc;
 
@@ -17,8 +18,6 @@ use candle_nn::{Embedding, Linear, VarBuilder};
 
 use crate::experiments::enrich;
 use layers::DecoderLayer;
-
-pub(crate) type ProbeOut = ((Vec<f32>, f64), Vec<(u32, f32)>);
 
 pub struct Model {
     pub(crate) embed_tokens: Embedding,
@@ -159,11 +158,9 @@ impl Model {
         let xs = self.run_layers(xs, &attention_mask, &sliding_attention_mask, seqlen_offset)?;
         let last = xs.narrow(1, seq_len - 1, 1)?;
         let out = self.finish(last.clone())?;
-        if self.enricher.is_some() {
+        if let Some(enr) = &mut self.enricher {
             let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
-            if let Some(enr) = &mut self.enricher {
-                enr.push_state(state);
-            }
+            enr.push_state(state);
         }
         Ok(out)
     }
@@ -211,10 +208,11 @@ impl Model {
         Ok(out)
     }
 
-    /// Feed the previous step's expected token embedding back into the first
-    /// block, skipping the embedding lookup of the sampled token. Also
-    /// resolves the feedback temperature for the configured mode and returns
-    /// the per-step feedback statistics.
+    /// Feed the previous step's blended input ((1 - a) sampled-token +
+    /// a expected embedding) back into the first block, skipping the pure
+    /// embedding lookup of the sampled token. Also resolves the feedback
+    /// temperature for the configured mode and returns the per-step
+    /// feedback statistics.
     pub fn forward_feedback(
         &mut self,
         logits: &Tensor,
@@ -355,8 +353,8 @@ impl Model {
         let iters = self.feedback.prefill_iters.max(1);
 
         // Scaled prompt embeddings E * sqrt(h) in F32: the base input every
-        // iteration blends against. (Gather + elementwise scaling, so
-        // identical to embedding per chunk.)
+        // iteration blends against. Gathered once for the whole prompt
+        // (per-chunk gathers would return the same rows).
         let base = self
             .embed_tokens
             .forward(input_ids)?
@@ -427,11 +425,9 @@ impl Model {
                 // The decode loop continues from this iteration's cache.
                 let last = xs.narrow(1, seq_len - 1, 1)?;
                 let logits = self.finish(last.clone())?;
-                if self.enricher.is_some() {
+                if let Some(enr) = &mut self.enricher {
                     let state = last.squeeze(1)?.squeeze(0)?.contiguous()?;
-                    if let Some(enr) = &mut self.enricher {
-                        enr.push_state(state);
-                    }
+                    enr.push_state(state);
                 }
                 let stats = PrefillStats {
                     temperature: stats_temperature,
@@ -476,27 +472,5 @@ impl Model {
         if let Some(enr) = &mut self.enricher {
             enr.clear_state();
         }
-    }
-
-    pub fn probe(&mut self, token: u32) -> Result<ProbeOut> {
-        let row = self
-            .embed_tokens
-            .embeddings()
-            .narrow(0, token as usize, 1)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?;
-        let row_v = row.to_vec1::<f32>()?;
-        let norm = (row_v.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
-        let input = Tensor::new(&[token], &self.device)?.unsqueeze(0)?;
-        let logits = self.forward(&input, 0)?;
-        let logits = logits.squeeze(0)?.squeeze(0)?.to_vec1::<f32>()?;
-        let mut order: Vec<usize> = (0..logits.len()).collect();
-        order.sort_by(|&i, &j| logits[j].total_cmp(&logits[i]));
-        let top5 = order
-            .iter()
-            .take(5)
-            .map(|&i| (i as u32, logits[i]))
-            .collect();
-        Ok(((row_v[..5].to_vec(), norm), top5))
     }
 }
