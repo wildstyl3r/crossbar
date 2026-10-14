@@ -76,20 +76,14 @@ Prompt "Once upon a time", seed 7, 40 tokens:
 
 ## Finding 2: the degradation signature is measurable in advance
 
-Diagnostics on the T=2.0 run — the transition into the attractor at step ~22
-is unambiguous, and all three hypothesized signals fire together:
-
-- `H_fb` runs away: ~0.1–6 nats during the coherent phase → **11.4 nats**
-  (support ≈ 90k of 262k tokens) inside the attractor.
-- `cos_prev` locks: 0.2–0.7 → **0.9998** (the smeared centroid stops moving).
-- `raw_H` jumps 0–3 → **~7 nats**: fed a broad centroid, the model predicts
-  nearly everything at once.
-- `norm_x` sags 25 → 11 (real-token scale → centroid scale).
-- `distinct2` drops 1.000 → ~0.93 (repeated bigrams appear).
-
-So entropy of the feedback distribution and consecutive-input cosine are
-sufficient early-warning signals; no output-side metric is needed for
-*prediction* (they serve as ground truth for validation).
+On the T=2.0 run, the transition into the attractor at step ~22 fires all
+three hypothesized input-side signals at once: `H_fb` runs away ~0.1–6 →
+**11.4 nats** (support ≈ 90k of 262k tokens), `cos_prev` locks 0.2–0.7 →
+**0.9998** (the smeared centroid stops moving), `norm_x` sags 25 → 11.
+Output-side ground truth agrees (`raw_H` jumps 0–3 → **~7 nats**: fed a
+broad centroid, the model predicts nearly everything at once; `distinct2`
+drops 1.000 → ~0.93). The input-side pair (`H_fb`, `cos_prev`) is
+sufficient for *prediction*; the output-side metrics serve as validation.
 
 ## Finding 3: the entropy servo works, in both directions
 
@@ -114,16 +108,14 @@ on the same acacia config:
   attractor at fixed T=2.
 - Overhead: ~35 ms/step on CPU (≈14 softmax passes over the 262k logits).
 
-## Finding 4: the threshold heuristic also works, but is choppier
+## Finding 4: the threshold heuristic (superseded)
 
-`--softmax-feedback-mode heuristic` (band ±1.0 nat around H*, decay γ=0.8,
+A fixed-band heuristic (`heuristic`: band ±1.0 nat around H*, decay γ=0.8,
 stagnation trigger cos > 0.999) also held the line on the acacia config, but
-T oscillates between band edges (1.28–3.13) instead of settling. Notably the
-stagnation (cosine) trigger never fired — the entropy band did all the work;
-the consecutive-cosine signal was redundant *here* (it may still matter for
-low-entropy loops). Removed from the CLI after Findings 3/5: the one-sided
-servo dominates it (settles instead of oscillating, and tames without
-blurring confident regimes).
+T oscillated between band edges (1.28–3.13) instead of settling, and the
+stagnation trigger never fired — the entropy band did all the work. Removed
+from the CLI after Findings 3/5: the one-sided servo dominates it (settles
+instead of oscillating, and tames without blurring confident regimes).
 
 ## Finding 5: forcing diversity hurts confident regimes — hence the one-sided servo
 
@@ -132,21 +124,19 @@ ten things to pack for a camping trip":
 
 - **Baseline**: clean, complete 10-item list, 200 tokens.
 - **entropy-servo (H\*=2.5)**: structure kept, content degraded ("A essential
-  for staying dry", "First-P"). In a confident regime (raw_H ≈ 0) the servo
+  for staying dry", "First-P") — in a confident regime (raw_H ≈ 0) the servo
   must *inflate* T well above 1 to reach H\*, blurring inputs the model
-  already meant precisely. Garbage-in at the semantic margin.
-- **One-sided servo** (`--softmax-feedback-mode one-sided-servo`): solves T as
-  above but **caps it at 1.0** — the servo only ever *tames* (T < 1 when the
-  raw distribution is flatter than H\*) and otherwise falls back to the
-  model's own distribution (T = 1) instead of blurring. Results:
-  - acacia config: still fully tamed (T mostly 1.0, dipping to 0.948 exactly
-    when raw_H exceeded H\*; coherent text, no attractor);
-  - greedy list: much better than the two-sided servo (structure and item
-    identities preserved, e.g. "First-Aid Kit", "Cooking Stove & Fuel"), EOS
-    at 178 tokens;
-  - but still slightly below baseline: even at T = 1 the full distribution's
-    tail mass blurs the input relative to the discrete sampled-token
-    embedding ("Water::", "Cooking Ut" slips remain).
+  already meant precisely.
+- **One-sided servo** (`--softmax-feedback-mode one-sided-servo`): solves T
+  as above but **caps it at 1.0** — it only ever *tames* (T < 1 when the raw
+  distribution is flatter than H\*), otherwise falls back to the model's own
+  distribution. Still fully tames the acacia config (T mostly 1.0, dipping
+  to 0.948 exactly when raw_H exceeded H\*; coherent text, no attractor);
+  much better than the two-sided servo on the greedy list (structure and
+  item identities preserved, e.g. "First-Aid Kit", "Cooking Stove & Fuel";
+  EOS at 178 tokens); but still slightly below baseline — even at T = 1 the
+  distribution's tail mass blurs the input relative to the discrete
+  sampled-token embedding ("Water::", "Cooking Ut" slips remain).
 
 ## Conclusions
 
@@ -168,7 +158,7 @@ ten things to pack for a camping trip":
 
 Because the feedback input is only constructed during multi-step generation,
 any teacher-forced (log-likelihood) benchmark is blind to it by construction.
-`--bench` therefore runs generate-then-score tasks in-process, greedy
+`--bench` therefore runs generate-then-score tasks in-process: greedy
 decoding, repeat penalty 1.0, identical paired prompts across modes
 (deterministic seeds), 100 examples per task (40 for trivia). Candidate tasks
 were calibrated first: 2-digit and even single-digit addition, and
@@ -195,24 +185,23 @@ Mean generated lengths are identical across modes (no early-EOS artifact).
 
 Interpretation:
 
-- **Copy/recall and semantic trivia are completely robust** to the feedback
-  across all modes — including 20-digit copies (~40 decode steps). Both are
+- **Copy/recall and semantic trivia are completely robust** across all
+  modes — including 20-digit copies (~40 decode steps). Both are
   max-confidence regimes (raw_H ≈ 0.06): the feedback distribution is
   essentially one-hot, so the expected embedding ≈ the argmax embedding.
 - **In-context induction is significantly damaged**: 60% → 43–47%
-  (13–17 points, p < 0.001). The failure mode is precise and mechanical: in
-  the servo CSV, 17 examples flipped right→wrong vs 1 wrong→right, and the
-  typical wrong answer is the correct mapping **truncated to its first
-  digit** ("68"→"6", "14"→"1", "69"→"6"). The induction head needs the exact
-  previous-position token identity to look up the in-context mapping; feeding
-  the expected embedding smears that key over the distribution's
-  neighborhood, and fine-grained precision (the second digit) is lost.
-- The one-sided servo does not rescue induction (44–47%): since induce raw_H
-  ≈ 0.5–0.6 < H\*, it runs at T = 1 — i.e. the damage comes from the tail
+  (p < 0.001). The failure is mechanical: 17 examples flipped right→wrong
+  vs 1 wrong→right, and the typical wrong answer is the correct mapping
+  **truncated to its first digit** ("68"→"6", "14"→"1", "69"→"6") — the
+  induction head needs the exact previous-position token identity as its
+  attention key, the expected embedding smears that key over the
+  distribution's neighborhood, and fine-grained precision (the second
+  digit) is lost.
+- The one-sided servo does not rescue induction (44–47%): induce raw_H
+  ≈ 0.5–0.6 < H\*, so it runs at T = 1 — the damage comes from the tail
   mass of the expected embedding at T = 1 itself, not from servo-inflated
-  temperatures. (Fixed-T1.0 vs baseline isolates exactly this effect.)
-  H\*=1.5 scores marginally best (47%) — the servo's occasional T<1 taming
-  when raw_H > 1.5 helps slightly.
+  temperatures (fixed-T1.0 vs baseline isolates exactly this; H\*=1.5 is
+  marginally best at 47% — occasional T<1 taming when raw_H > 1.5 helps).
 - Practical takeaway: expected-embedding feedback is safe for confident,
   precision-doesn't-matter regimes (fluency, style, topic continuation) and
   costs measurable ICL precision. If ICL preservation matters, the next
@@ -220,8 +209,8 @@ Interpretation:
   top-k mass before the embedding mixture) so the input stays near the
   sampled token while still bounding worst-case smear.
 
-Reproduce: `cargo run --release -- --cpu --bench --bench-n 100` (per-example
-rows land in `bench_results.csv`; calibration used `--bench-n 25`).
+Reproduce: `cargo run --release -- --cpu --bench --bench-n 100` (see
+Example commands; calibration used `--bench-n 25`).
 
 ## Finding 7: blending rescues most of the induction damage; parallel prefill feedback is destructive
 
@@ -257,13 +246,13 @@ Same protocol as Finding 6, greedy, paired, N=100/40:
   sampled-token re-anchor preserves the exact attention key the induction
   head needs, as predicted.
 - **Parallel prefill feedback at a_p=0.5 is uniformly destructive** — every
-  task collapses (digits 0-2%, induce 3-4%, trivia 45-50%), and generated
-  lengths balloon to the token caps (21/32/52 tokens = degeneration). Note
-  the prefill blend is a *lookahead* injection (each position receives the
+  task collapses (digits 0-2%, induce 3-4%, trivia 45-50%) and generated
+  lengths balloon to the token caps (21/32/52 tokens = degeneration). The
+  prefill blend is a *lookahead* injection (each position receives the
   expected next-token embedding derived from that position's own logits),
   which at 50% strength overwhelms the early-layer processing of the whole
-  context. Even semantic trivia (weight-stored knowledge) loses a quarter of
-  its accuracy.
+  context — even semantic trivia (weight-stored knowledge) loses a quarter
+  of its accuracy.
 - Conclusion: the enrichment *strength* (and where it is applied) cannot be
   a fixed constant — it must be learned, per step. This directly motivates
   the trained cross-attention enricher with a learned gate
@@ -303,81 +292,58 @@ N=100/50 for the winning config):
 Interpretation:
 
 - **Strength dominates depth.** At a_p=0.5 the lookahead injection
-  compounds: K=2 is worse than K=1 and K=3 only turns the *dynamics*
-  around (not the bench). At a_p=0.25 the cascade is uniformly safe at all
-  K probed.
-- **The iterated cascade at gentle strength is the first prompt-side
-  mechanism that *improves* ICL**: induce 78% vs 60% baseline
-  (+18, p=0.006, N=100), also above blend-d0.5 (56%). Each prompt position
-  receives 25% of the previous iteration's expected continuation of its
-  own output while the exact token keys stay anchored at 75% — the
-  induction head keeps its precise keys and gains anticipatory context.
+  compounds (K=2 worse than K=1; K=3 only repairs the *dynamics*, not the
+  bench). At a_p=0.25 the cascade is uniformly safe at all K probed.
+- **The gentle-strength iterated cascade is the first prompt-side mechanism
+  that *improves* ICL**: induce 78% vs 60% baseline (+18, p=0.006, N=100),
+  also above blend-d0.5 (56%). Each prompt position receives 25% of the
+  previous iteration's expected continuation of its own output while the
+  exact token keys stay anchored at 75% — the induction head keeps its
+  precise keys and gains anticipatory context.
 - digits/trivia essentially unharmed (digits-5 94% / digits-10 88% vs
   100/96, both ns at N=50; trivia identical). Watch item: induce mean
   generated length rose (6.5 vs 3.8 tokens — some answers run past the
   number before EOS).
-- This is an inference-only effect (no training) measured with the
-  hand-set blend operator; the learned per-step gate (ENRICHER.md) is
-  expected to own the strength schedule — the a_p=0.5 destruction shows
-  fixed strength cannot be rescued by depth alone.
-
-Reproduce:
-
-```sh
-# dynamics probe (per-step CSV on stderr)
-cargo run --release -- --cpu -p "<long France paragraph>" -n 40 --seed 7 \
-    --temperature 0 --softmax-feedback-diagnostics \
-    --prefill-feedback-blend 0.25 --prefill-feedback-iters 2
-
-# bench (cascade modes; filters select the subset)
-cargo run --release -- --cpu --bench --bench-n 100 --bench-tasks induce,trivia \
-    --bench-modes baseline,cascade-k2-a25
-```
+- Inference-only effect (no training), measured with the hand-set blend
+  operator; the learned per-step gate (ENRICHER.md) is expected to own the
+  strength schedule — the a_p=0.5 destruction shows fixed strength cannot
+  be rescued by depth alone.
 
 ## Bench validity note (2026-10-08): `induce` queries are always the last-stated pair
 
 Auditing the bench for train/eval leakage surfaced a task-design issue that
 reinterprets Finding 6's induce column:
 
-- **The original bench `induce` never shuffles its statements** (bench.rs
-  `build_examples`): 5 pairs are drawn in order and `query = chosen[4]`,
-  so the queried pair is always the LAST stated one. Verified empirically:
-  **400/400 induce rows in `bench_results.csv`** have the queried word as
-  the final "X is N" statement before the question.
-- **Consequence**: the task is solvable by "echo the last stated number"
-  with zero word->number binding. The Finding 6 damage signature
-  ("68" -> "6", "14" -> "1") is a generation truncation of the *correct*
-  value — consistent with last-number copying as much as with
-  induction-head lookup. The 60% -> 43-47% feedback damage should be read
-  partly as degraded positional-copy precision, not purely as in-context
-  induction damage.
-- **In-family, not transfer**: bench `induce` also shares the statement
-  and question format, the number range, and 15/16 vocabulary words with
-  the enricher training task induce-d, and training prompts cover every
-  (word -> number) pair ~8x (12k pair-instances over 15 x 99 = 1,485
-  combos). This is unexploitable — the mapping is random per example, so
-  no consistent association exists to memorize, and the answer always
-  derives from the prompt's own context — but it means bench induce
-  measures the same skill family the enricher trains on, not an
-  independent capability. digits/trivia are unaffected (no training
+- The original bench `induce` never shuffles its statements (bench.rs
+  `build_examples`): 5 pairs are drawn in order and `query = chosen[4]`, so
+  the queried pair is always the LAST stated one (verified: 400/400 induce
+  rows in `bench_results.csv`).
+- Consequence: the task is solvable by "echo the last stated number" with
+  zero word->number binding. The Finding 6 damage signature ("68" -> "6",
+  "14" -> "1") is a truncation of the *correct* value — consistent with
+  last-number copying as much as with induction-head lookup — so the
+  60% -> 43-47% damage should be read partly as degraded positional-copy
+  precision, not purely as in-context induction damage.
+- In-family, not transfer: bench `induce` shares statement/question format,
+  number range, and 15/16 vocabulary words with the enricher training task
+  induce-d, and training prompts cover every (word -> number) pair ~8x
+  (12k pair-instances over 15 x 99 = 1,485 combos). Unexploitable — the
+  mapping is random per example, so no consistent association exists to
+  memorize, and the answer always derives from the prompt's own context —
+  but bench induce measures the same skill family the enricher trains on,
+  not an independent capability. digits/trivia are unaffected (no training
   counterpart).
 
 Remediation (in bench.rs, old task kept for comparability with Findings
-6-8):
-
-- `induce-sh`: same 5-pair task with statements shuffled (mirrors the
-  induce-d generator) — the queried pair lands at a random position and
-  the last-number shortcut fails.
-- `induce-early`: the queried pair is drawn from positions 0..4 (never
-  last-drawn) with shuffled statements — the answer requires binding the
-  query word to its stated number anywhere in context; last-number
-  copying is correct only by chance (~1/5).
+6-8): `induce-sh` — same 5-pair task with statements shuffled (mirrors the
+induce-d generator), so the queried pair lands at a random position and the
+last-number shortcut fails; `induce-early` — the queried pair is drawn from
+positions 0..4 (never last-drawn) with shuffled statements, so the answer
+requires binding the query word to its stated number anywhere in context
+(last-number copying is correct only by chance, ~1/5).
 
 For enricher verdicts, cite `induce-sh` / `induce-early`; treat the
 original `induce` as a copy-precision + in-family diagnostic.
-
-Reproduce: `cargo run --release -- --cpu --bench --bench-n 100
---bench-tasks induce,induce-sh,induce-early --bench-modes baseline`
 
 ## Example commands
 
@@ -402,4 +368,20 @@ cargo run --release -- --cpu \
     --fallback-dir models/gemma-3-270m-it \
     -p "Once upon a time" -n 40 --seed 7 \
     --softmax-feedback --softmax-feedback-mode entropy-servo
+
+# bench, Finding 6 protocol (per-example rows land in bench_results.csv;
+# task calibration used --bench-n 25)
+cargo run --release -- --cpu --bench --bench-n 100
+
+# Finding 8 cascade: dynamics probe (per-step CSV on stderr; use a long
+# France-paragraph prompt) + bench
+cargo run --release -- --cpu -p "<long France paragraph>" -n 40 --seed 7 \
+    --temperature 0 --softmax-feedback-diagnostics \
+    --prefill-feedback-blend 0.25 --prefill-feedback-iters 2
+cargo run --release -- --cpu --bench --bench-n 100 --bench-tasks induce,trivia \
+    --bench-modes baseline,cascade-k2-a25
+
+# bench validity check: the original induce vs the shuffled variants
+cargo run --release -- --cpu --bench --bench-n 100 \
+    --bench-tasks induce,induce-sh,induce-early --bench-modes baseline
 ```

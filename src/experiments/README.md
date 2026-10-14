@@ -22,12 +22,9 @@ decode-time hooks these mechanisms plug into.
 
 ## Flows
 
-- **Decode hooks**: the engine's `forward_feedback` (expected-embedding
-  decode feedback), `forward_prompt_blend` (prefill cascade) and
-  `cascade_step` (sequential enricher cascade) implement the mechanisms
-  specified by `feedback.rs` / `enrich.rs`; their specs come from
-  `experiments::feedback` / `experiments::enrich`, the CLI groups from
-  `experiments::args`.
+- **Decode hooks**: the engine's `forward_feedback`, `forward_prompt_blend`
+  and `cascade_step` (listed in the repository README) implement what
+  `feedback.rs` / `enrich.rs` specify; the CLI groups come from `args.rs`.
 - **Training**: `main` -> `experiments::train::run`; batches come from
   `experiments::tasks::build_dataset`, the graph is built by
   `experiments::cascade::cascade_train_forward` (via

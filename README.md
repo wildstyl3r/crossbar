@@ -19,9 +19,9 @@ they plug into are part of the core backends.
 ## Quickstart
 
 Requirements: Rust 1.85+ (the crate uses edition 2024). CPU-only is fine —
-the 270M model needs ~1 GB RAM as safetensors and ~200 MB as Q4_0 GGUF.
+the 270M model runs in ~1 GB RAM from safetensors or ~200 MB from Q4_0 GGUF.
 
-On the first run, with no weights under `models/`, the binary offers to
+On the first run with no weights under `models/`, the binary offers to
 download them from Hugging Face:
 
 ```text
@@ -33,24 +33,21 @@ No model weights found under models/. They can be downloaded now from Hugging Fa
 Choose [1]:
 ```
 
-Option 1 needs no HF account: the GGUF comes from the non-gated
-lmstudio-community mirror; the tokenizer/template files come from google
-when an `HF_TOKEN` (or `huggingface-cli login`) token is available and from
-the non-gated unsloth mirror otherwise. Interrupted downloads resume.
-Non-interactive shells skip the prompt — pass `--download gguf` (or
-`--download safetensors`) explicitly; overriding `--model-dir` /
-`--fallback-dir` disables the auto-download entirely.
+Option 1 needs no HF account (non-gated lmstudio-community mirror).
+Tokenizer/template files come from google when an `HF_TOKEN` (or
+`huggingface-cli login`) token is available, from the non-gated unsloth
+mirror otherwise. Downloads resume after interruption. Non-interactive
+shells skip the prompt — pass `--download gguf` (or `--download
+safetensors`) explicitly; overriding `--model-dir` / `--fallback-dir`
+disables the auto-download entirely.
 
-Manual placement is unchanged: weights under `models/gemma-3-270m-it`
-(safetensors, from
-[google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it),
-keeping `config.json`, `tokenizer.json`, `chat_template.jinja`,
-`generation_config.json`, `model.safetensors`) and optionally
-`models/gemma-3-270m-it-qat-GGUF/` for the quantized backend (a QAT Q4_0
-GGUF of the same model — see the HF model page; the original is
-[google/gemma-3-270m-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-3-270m-it-qat-q4_0-unquantized)).
-Only the `.gguf` file is needed there; the tokenizer/template/config fall
-back to `--fallback-dir`.
+Manual placement: safetensors under `models/gemma-3-270m-it` from
+[google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it)
+(keep `config.json`, `tokenizer.json`, `chat_template.jinja`,
+`generation_config.json`, `model.safetensors`); optionally a QAT Q4_0 GGUF
+of the same model under `models/gemma-3-270m-it-qat-GGUF/` (only the
+`.gguf` file is needed; tokenizer/template/config fall back to
+`--fallback-dir`).
 
 ```sh
 cargo run --release -- --cpu -p "Name three colors:" -n 128 --seed 42
@@ -90,13 +87,12 @@ cargo run --release -- --cpu --repl --tools auto   # interactive chat with tool 
   `forward_feedback`, prefill cascade `forward_prompt_blend`, sequential
   enricher cascade `cascade_step`); their specs come from `experiments`.
 - **REPL**: `main` (`--repl`) -> `repl::run`, fully synchronous. Turns
-  reuse the KV cache: the ids actually forwarded by each generation are
-  remembered, and the next prompt is assembled at the token level so only
-  the suffix is pre-filled; on any mismatch the cache is cleared and the
-  whole prompt re-prefilled — correctness never depends on the cache
-  hitting. `/tool required` attaches a `grammar::SchemaMasker` forcing the
-  tool-call envelope; `/schema <file>` masks the reply to any supported
-  JSON schema.
+  reuse the KV cache: each generation remembers the ids it actually
+  forwarded, the next prompt is assembled at the token level so only the
+  suffix is pre-filled, and any mismatch clears the cache and re-prefills
+  the whole prompt — correctness never depends on the cache hitting.
+  `/tool required` forces the tool-call envelope via `grammar::SchemaMasker`;
+  `/schema <file>` masks the reply to any supported JSON schema.
 
 ## Known limitations
 
