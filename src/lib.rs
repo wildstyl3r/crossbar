@@ -7,6 +7,7 @@ pub mod assets;
 pub mod chat;
 pub mod cli;
 pub mod config;
+pub mod download;
 pub mod engine;
 pub mod experiments;
 pub mod generation;

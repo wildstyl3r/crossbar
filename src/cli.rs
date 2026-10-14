@@ -4,6 +4,7 @@
 
 use clap::Parser;
 
+use crate::download::Backend;
 use crate::experiments::args::{BenchArgs, FeedbackArgs, TrainArgs};
 
 #[derive(Parser, Debug)]
@@ -32,7 +33,8 @@ pub struct Args {
     #[arg(long)]
     pub system: Option<String>,
 
-    /// Directory containing the model files; auto-detects GGUF (quantized) vs safetensors.
+    /// Directory containing the model files; auto-detects GGUF (quantized)
+    /// vs safetensors. Overriding it disables the first-run download.
     #[arg(long, default_value = "models/gemma-3-270m-it-qat-GGUF")]
     pub model_dir: String,
 
@@ -40,6 +42,12 @@ pub struct Args {
     /// when they are missing from --model-dir.
     #[arg(long, default_value = "models/gemma-3-270m-it")]
     pub fallback_dir: String,
+
+    /// Download the weights for a backend into the default models/ layout
+    /// and exit; without a choice, missing weights trigger an interactive
+    /// prompt (a terminal is required).
+    #[arg(long, value_enum)]
+    pub download: Option<Backend>,
 
     /// The temperature used to generate samples, 0 means greedy decoding.
     #[arg(long)]

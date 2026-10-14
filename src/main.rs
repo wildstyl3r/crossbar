@@ -9,6 +9,7 @@ use crossbar::experiments::bench;
 use crossbar::chat;
 use crossbar::cli::Args;
 use crossbar::config;
+use crossbar::download;
 use crossbar::engine::Engine;
 use crossbar::experiments::feedback::{FeedbackConfig, FeedbackTempMode};
 use crossbar::generation;
@@ -20,8 +21,22 @@ use crossbar::experiments::train;
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let model_dir = std::path::Path::new(&args.model_dir);
-    let fallback_dir = std::path::Path::new(&args.fallback_dir);
+    // Fetch the Gemma weights from Hugging Face when the defaults are
+    // missing (a no-op with explicit --model-dir/--fallback-dir or when
+    // everything is already on disk), then resolve the effective dirs.
+    download::ensure_weights(&args)?;
+    if args.download.is_some()
+        && args.prompt.is_none()
+        && !args.repl
+        && !args.bench_args.bench
+        && !args.train_args.train_enricher
+    {
+        println!("done — e.g. run `cargo run --release -- --repl` to chat");
+        return Ok(());
+    }
+    let (model_dir, fallback_dir) = download::resolve_dirs(&args);
+    let model_dir = model_dir.as_path();
+    let fallback_dir = fallback_dir.as_path();
     let generation_config: GenerationConfig = match std::fs::File::open(resolve_file(
         model_dir,
         fallback_dir,

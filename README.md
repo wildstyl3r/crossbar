@@ -21,18 +21,36 @@ they plug into are part of the core backends.
 Requirements: Rust 1.85+ (the crate uses edition 2024). CPU-only is fine —
 the 270M model needs ~1 GB RAM as safetensors and ~200 MB as Q4_0 GGUF.
 
-Model weights are gated; accept Google's Gemma license on Hugging Face
-first, then place them as:
+On the first run, with no weights under `models/`, the binary offers to
+download them from Hugging Face:
 
-- `models/gemma-3-270m-it` — safetensors backend, from
-  [google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it)
-  (keep `config.json`, `tokenizer.json`, `chat_template.jinja`,
-  `generation_config.json`, `model.safetensors`).
-- `models/gemma-3-270m-it-qat-GGUF/` — quantized backend, a QAT Q4_0 GGUF
-  build of the same model (see the HF model page; the original is
-  [google/gemma-3-270m-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-3-270m-it-qat-q4_0-unquantized)).
-  Only the `.gguf` file is needed here; the tokenizer/template/config fall
-  back to `--fallback-dir` (default `models/gemma-3-270m-it`).
+```text
+No model weights found under models/. They can be downloaded now from Hugging Face:
+  1) quantized GGUF  ~241 MB  lmstudio-community/gemma-3-270m-it-qat-GGUF  (recommended)
+  2) safetensors     ~1.1 GB  google/gemma-3-270m-it  (requires accepting
+     Google's license at https://huggingface.co/google/gemma-3-270m-it and an HF token)
+  3) exit
+Choose [1]:
+```
+
+Option 1 needs no HF account: the GGUF comes from the non-gated
+lmstudio-community mirror; the tokenizer/template files come from google
+when an `HF_TOKEN` (or `huggingface-cli login`) token is available and from
+the non-gated unsloth mirror otherwise. Interrupted downloads resume.
+Non-interactive shells skip the prompt — pass `--download gguf` (or
+`--download safetensors`) explicitly; overriding `--model-dir` /
+`--fallback-dir` disables the auto-download entirely.
+
+Manual placement is unchanged: weights under `models/gemma-3-270m-it`
+(safetensors, from
+[google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it),
+keeping `config.json`, `tokenizer.json`, `chat_template.jinja`,
+`generation_config.json`, `model.safetensors`) and optionally
+`models/gemma-3-270m-it-qat-GGUF/` for the quantized backend (a QAT Q4_0
+GGUF of the same model — see the HF model page; the original is
+[google/gemma-3-270m-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-3-270m-it-qat-q4_0-unquantized)).
+Only the `.gguf` file is needed there; the tokenizer/template/config fall
+back to `--fallback-dir`.
 
 ```sh
 cargo run --release -- --cpu -p "Name three colors:" -n 128 --seed 42
