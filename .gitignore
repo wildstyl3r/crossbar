@@ -1,4 +1,5 @@
-bench_results.csv
+bench_*.csv
+bench_*.log
 enricher*.safetensors
 /models
 /target

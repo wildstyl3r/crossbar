@@ -581,7 +581,9 @@ Bench validity: the original bench `induce` is an in-family validation of
 induce-d, not independent transfer — its statements are NOT shuffled, so
 it is solvable by echoing the last stated number. Use the binding-honest
 variants `induce-sh` / `induce-early`; details in the bench-validity note
-in FEEDBACK.md. digits/trivia remain clean transfer measures.
+in FEEDBACK.md, where the Finding-8 prefill-cascade gain was rechecked on
+both variants (2026-10-15: holds, larger than on the original task).
+digits/trivia remain clean transfer measures.
 
 ## Inference integration
 

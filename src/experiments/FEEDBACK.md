@@ -343,7 +343,48 @@ requires binding the query word to its stated number anywhere in context
 (last-number copying is correct only by chance, ~1/5).
 
 For enricher verdicts, cite `induce-sh` / `induce-early`; treat the
-original `induce` as a copy-precision + in-family diagnostic.
+original `induce` as a copy-precision + in-family diagnostic. Rechecked
+2026-10-15 (next section): the Finding-8 cascade gain holds, and is larger,
+on both honest variants.
+
+## Finding 8 recheck (2026-10-15): the cascade gain survives the honest variants
+
+The validity note above showed Finding 8's +18 was measured on a task that
+never requires binding (the queried pair is always stated last; verified
+100/100 in the anchor run), so the gain could have been improved copy
+precision rather than improved ICL. Re-measured on the binding-honest
+variants with the Finding-8 operator verbatim (`cascade-k2-a25`), N=100,
+greedy, paired, safetensors F32:
+
+| task | baseline | cascade-k2-a25 | flips (w→r / r→w) | exact McNemar |
+|------|----------|----------------|-------------------|---------------|
+| induce (anchor) | 60% | 78% | 29 / 11 | p=0.006 |
+| induce-sh | 38% | **71%** | 38 / 5 | p<1e-6 |
+| induce-early | 37% | **70%** | 41 / 8 | p=2e-6 |
+
+- **Not a shortcut artifact.** On both honest variants the same operator
+  roughly doubles baseline with the w→r side dominating (38/5, 41/8). When
+  the last-number echo stops being correct the honest baselines collapse to
+  ~37% — the cascade lifts both to ~70%, i.e. most of the accuracy the
+  model reaches on the shortcut task, without the shortcut. The benefit is
+  largest exactly where binding is required.
+- **The anchor reproduces Finding 8 exactly** (60% -> 78%, p=0.006, same
+  N=100 paired example set); its `target == last-stated number` property
+  holds 100/100, so it serves only as the comparability bridge.
+- **Replicates are bit-identical per-example** (anchor 200/200, honest
+  400/400 prediction/correct/gen-token rows): run-to-run variance did not
+  materialize in this config.
+- Watch item reproduces and grows: under the cascade 54-60% of generations
+  run to the 8-token cap (baseline <= 1%; mean 3.8-3.9 -> 6.1-6.5 tokens).
+  The last-int scoring rule absorbs the format drift (capped answers are
+  nearly all correct), but the emitted answers run on past the number.
+- Verdict: cite `induce-sh` / `induce-early` for the ICL claim; the original
+  `induce` stays as the documented anchor.
+
+Reproduce: `cargo run --release -- --cpu --model-dir models/gemma-3-270m-it
+--bench --bench-n 100 --bench-tasks induce-sh,induce-early --bench-modes
+baseline,cascade-k2-a25 --bench-out bench_induce_honest_n100.csv` (swap the
+task list for `induce` for the anchor; per-example rows land in the CSV).
 
 ## Example commands
 
